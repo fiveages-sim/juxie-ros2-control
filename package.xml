@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>jx_ros2_control</name>
+  <name>juxie_ros2_control</name>
   <version>1.0.0</version>
   <description>ROS2 Control Hardware Interface for JX motors via CAN FD</description>
   <maintainer email="your_email@example.com">Your Name</maintainer>
@@ -19,6 +19,6 @@
 
   <export>
     <build_type>ament_cmake</build_type>
-    <hardware_interface plugin="${prefix}/jx_ros2_control.xml"/>
+    <hardware_interface plugin="${prefix}/juxie_ros2_control.xml"/>
   </export>
 </package>

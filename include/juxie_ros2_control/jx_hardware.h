@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cmath>
 
-namespace jx_ros2_control {
+namespace juxie_ros2_control {
 class JxHardware : public hardware_interface::SystemInterface {
 public:
     hardware_interface::CallbackReturn on_init(
@@ -84,4 +84,4 @@ private:
     bool sendMultiMotorCommand();       // 发送多控帧
     bool sendSyncFrame();               // 发送同步帧
 };
-} // namespace jx_ros2_control
+} // namespace juxie_ros2_control

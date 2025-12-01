@@ -1,4 +1,4 @@
-#include "jx_ros2_control/jx_hardware.h"
+#include "juxie_ros2_control/jx_hardware.h"
 #include <pluginlib/class_list_macros.hpp>
 #include <algorithm>
 #include <sstream>
@@ -7,7 +7,7 @@
 #include <cstring>
 #include <cerrno>
 
-namespace jx_ros2_control {
+namespace juxie_ros2_control {
 
 int16_t JxHardware::angleToInt16(double angle) {
     // 将输入角度限制在[-180, 180]度范围内
@@ -382,7 +382,7 @@ void JxHardware::controlLoop() {
     RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
 }
 
-} // namespace jx_ros2_control
+} // namespace juxie_ros2_control
 
 // 导出插件
-PLUGINLIB_EXPORT_CLASS(jx_ros2_control::JxHardware, hardware_interface::SystemInterface)
+PLUGINLIB_EXPORT_CLASS(juxie_ros2_control::JxHardware, hardware_interface::SystemInterface)

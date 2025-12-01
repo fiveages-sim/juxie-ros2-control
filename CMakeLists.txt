@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(jx_ros2_control)
+project(juxie_ros2_control)
 
 if (CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
@@ -41,7 +41,7 @@ ament_target_dependencies(
 )
 
 # 导出硬件插件
-pluginlib_export_plugin_description_file(hardware_interface jx_ros2_control.xml)
+pluginlib_export_plugin_description_file(hardware_interface juxie_ros2_control.xml)
 
 # 安装头文件
 install(
