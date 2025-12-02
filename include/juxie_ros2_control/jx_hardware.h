@@ -52,6 +52,7 @@ private:
     static constexpr int16_t RAW_MIN = -32568;             // 协议定义的最小计数（对应-180度）
     static constexpr int16_t RAW_MAX = 32568;              // 协议定义的最大计数（对应180度）
     static constexpr uint8_t MAX_MOTOR_COUNT = 8;          // 多控帧最多支持8个电机
+    bool is_first_command_ = true;  // 新增：标记是否是第一次发送命令
 
     // 仅保留必要配置参数
     std::string can_interface_;        // CAN接口名（默认can0）

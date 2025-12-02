@@ -287,11 +287,12 @@ bool JxHardware::sendSyncFrame() {
 bool JxHardware::sendMultiMotorCommand() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     uint8_t data[CANFD_MAX_LEN] = {0};
+    uint8_t control_byte = is_first_command_ ? 0xD8 : 0xD0;
 
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         int pkg_offset = i * 7;
-        data[pkg_offset + 0] = 0xD0; // 控制位：ENABLE=1、BRAKE=1、MODE=位置模式
+        data[pkg_offset + 0] = control_byte; // 控制位：ENABLE=1、BRAKE=1、MODE=位置模式
         data[pkg_offset + 1] = (raw_position_commands_[i] >> 8) & 0xFF; // 位置高字节
         data[pkg_offset + 2] = raw_position_commands_[i] & 0xFF;        // 位置低字节
         data[pkg_offset + 3] = 0x00; // TC=0（位置模式无需电流前馈）
@@ -324,47 +325,45 @@ bool JxHardware::readMotorStates() {
     struct timeval timeout = {0, 100000}; // 100ms超时
     ::setsockopt(can_socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    for (size_t i = 0; i < motor_ids_.size(); ++i) {
-        uint8_t id = motor_ids_[i];
-        uint32_t feedback_id = SINGLE_FEEDBACK_BASE + id;
-        struct canfd_frame frame;
-        memset(&frame, 0, sizeof(frame));
-
-        if (::read(can_socket_, &frame, sizeof(frame)) <= 0) {
-            RCLCPP_WARN(get_node()->get_logger(), "Motor %d read timeout", id);
-            continue;
-        }
-        if (frame.can_id != static_cast<canid_t>(feedback_id)) {
-            RCLCPP_WARN(get_node()->get_logger(), "Unexpected feedback ID: 0x%X (expected 0x%X)", 
-                       frame.can_id, feedback_id);
-            continue;
+    struct canfd_frame frame;
+    while (true) {
+        ssize_t nbytes = ::read(can_socket_, &frame, sizeof(frame));
+        if (nbytes <= 0) {
+            break; // 超时或无数据
         }
 
-        // 解析位置：int16→角度→弧度
-        int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
-        double angle_deg = int16ToAngle(raw_pos);
-        joint_positions_[i] = angle_deg * M_PI / 180.0;
+        // 检查是否是目标电机的反馈帧（0x300 + id）
+        if (frame.can_id >= SINGLE_FEEDBACK_BASE && frame.can_id < SINGLE_FEEDBACK_BASE + 256) {
+            uint8_t motor_id = frame.can_id - SINGLE_FEEDBACK_BASE;
+            // 查找该电机在列表中的索引
+            auto it = std::find(motor_ids_.begin(), motor_ids_.end(), motor_id);
+            if (it != motor_ids_.end()) {
+                size_t idx = std::distance(motor_ids_.begin(), it);
+                // 解析数据到对应电机
+                int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
+                double angle_deg = int16ToAngle(raw_pos);
+                joint_positions_[idx] = angle_deg * M_PI / 180.0;
 
-        // 解析速度：RPM→弧度/秒
-        int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
-        joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
+                int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
+                joint_velocities_[idx] = raw_vel * 2 * M_PI / 60.0;
 
-        uint8_t status_byte = frame.data[6];
-        bool enable = (status_byte & 0x20) != 0;
-        // bool brake = (status_byte & 0x10) != 0; 
-        bool error = (status_byte & 0x08) != 0;
-        // uint8_t mode = (status_byte & 0xC0) >> 6;
-        if (!enable) {
-            RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 
-                               5000, "Motor %d is not enabled", id);
+                uint8_t status_byte = frame.data[6];
+                bool enable = (status_byte & 0x20) != 0;
+                bool error = (status_byte & 0x08) != 0;
+
+                if (!enable) {
+                    RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 
+                                       5000, "Motor %d is not enabled", motor_id);
+                }
+                if (error) {
+                    RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                        1000, "Motor %d has error,error code is 0x%02X", motor_id,status_byte);
+                }
+
+            }
         }
-        if (error) {
-            RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                1000, "Motor %d has error,error code is 0x%02X", id,status_byte);
-        }
-
-
     }
+
     return true;
 }
 
