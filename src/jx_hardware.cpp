@@ -316,6 +316,12 @@ bool JxHardware::sendMultiMotorCommand() {
         RCLCPP_ERROR(get_node()->get_logger(), "Multi-motor command failed: %s", strerror(errno));
         return false;
     }
+    // 第一次发送后更新标志
+    if (is_first_command_) {
+        RCLCPP_INFO(get_node()->get_logger(), "Sent first command with control byte 0xD8");
+        is_first_command_ = false;
+    }
+
     return true;
 }
 
