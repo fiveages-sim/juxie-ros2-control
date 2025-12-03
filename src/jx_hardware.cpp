@@ -120,8 +120,11 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
 
     // 发送同步帧→获取初始状态（仅初始化时发送一次）
     sendSyncFrame();
-    readMotorStates();
-
+    if (!readMotorStates(true)) { 
+        RCLCPP_ERROR(get_node()->get_logger(), "Incomplete motor state initialization");
+        ::close(can_socket_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
     // 初始化命令缓冲区
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         joint_position_commands_[i] = joint_positions_[i]; // 弧度
@@ -193,7 +196,7 @@ JxHardware::on_export_command_interfaces() {
 // === ROS2 Control 读写接口 ===
 hardware_interface::return_type JxHardware::read(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
-    readMotorStates(); 
+    readMotorStates(false); 
     return hardware_interface::return_type::OK;
 }
 
@@ -324,49 +327,73 @@ bool JxHardware::sendMultiMotorCommand() {
 
     return true;
 }
-
-// === 读取电机状态（解析协议反馈帧0x300+ID）===
-bool JxHardware::readMotorStates() {
+// === 读取电机状态（非阻塞读取+缓存所有反馈）===
+bool JxHardware::readMotorStates(bool strict_check) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    struct timeval timeout = {0, 100000}; // 100ms超时
+    struct timeval timeout = {0, 1000}; // 缩短超时到1ms，避免阻塞
     ::setsockopt(can_socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
+    // 创建临时映射表存储最新反馈
+    std::unordered_map<uint8_t, canfd_frame> feedback_map;
     struct canfd_frame frame;
+    
+    // 读取所有可用的CAN帧
     while (true) {
         ssize_t nbytes = ::read(can_socket_, &frame, sizeof(frame));
         if (nbytes <= 0) {
-            break; // 超时或无数据
+            break; // 无数据或超时
         }
 
-        // 检查是否是目标电机的反馈帧（0x300 + id）
+        // 检查是否是目标电机的反馈帧
         if (frame.can_id >= SINGLE_FEEDBACK_BASE && frame.can_id < SINGLE_FEEDBACK_BASE + 256) {
             uint8_t motor_id = frame.can_id - SINGLE_FEEDBACK_BASE;
-            // 查找该电机在列表中的索引
-            auto it = std::find(motor_ids_.begin(), motor_ids_.end(), motor_id);
-            if (it != motor_ids_.end()) {
-                size_t idx = std::distance(motor_ids_.begin(), it);
-                // 解析数据到对应电机
-                int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
-                double angle_deg = int16ToAngle(raw_pos);
-                joint_positions_[idx] = angle_deg * M_PI / 180.0;
-
-                int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
-                joint_velocities_[idx] = raw_vel * 2 * M_PI / 60.0;
-
-                uint8_t status_byte = frame.data[6];
-                bool enable = (status_byte & 0x20) != 0;
-                bool error = (status_byte & 0x08) != 0;
-
-                if (!enable) {
-                    RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 
-                                       5000, "Motor %d is not enabled", motor_id);
-                }
-                if (error) {
-                    RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                        1000, "Motor %d has error,error code is 0x%02X", motor_id,status_byte);
-                }
-
+            // 只缓存我们关心的电机反馈
+            if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
+                feedback_map[motor_id] = frame; // 更新最新反馈
             }
+        }
+    }
+
+    if(feedback_map.size()!=motor_ids_.size() && strict_check )
+    {
+        RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                            1000, "feedback_map size is,motor ids size is:%d ,%d",feedback_map.size(),motor_ids_.size());
+        return false;
+    }
+
+
+
+
+    // 处理缓存的反馈数据
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        uint8_t id = motor_ids_[i];
+        auto it = feedback_map.find(id);
+        
+        if (it != feedback_map.end()) {
+            // 解析数据
+            const canfd_frame& frame = it->second;
+            int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
+            double angle_deg = int16ToAngle(raw_pos);
+            joint_positions_[i] = angle_deg * M_PI / 180.0;
+
+            int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
+            joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
+
+            uint8_t status_byte = frame.data[6];
+            bool enable = (status_byte & 0x20) != 0;
+            bool error = (status_byte & 0x08) != 0;
+
+            if (!enable) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 
+                                   5000, "Motor %d is not enabled", id);
+            }
+            if (error) {
+                RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                    1000, "Motor %d has error, error code: 0x%02X", id, status_byte);
+            }
+        } else {
+            RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                1000, "No feedback for motor %d", id);
         }
     }
 
