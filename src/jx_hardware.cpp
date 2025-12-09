@@ -67,6 +67,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     size_t motor_count = motor_ids_.size();
     joint_positions_.resize(motor_count, 0.0);
     joint_velocities_.resize(motor_count, 0.0);
+    joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
     running_ = false;
@@ -174,6 +175,11 @@ JxHardware::on_export_state_interfaces() {
         state_interfaces.push_back(
             std::make_shared<hardware_interface::StateInterface>(
                 joint_name, hardware_interface::HW_IF_VELOCITY, &joint_velocities_[i]));
+        state_interfaces.push_back(
+            std::make_shared<hardware_interface::StateInterface>(
+                joint_name, hardware_interface::HW_IF_EFFORT, &joint_efforts_[i]));
+
+
     }
     RCLCPP_INFO(get_node()->get_logger(), "Exported %zu state interfaces (position+velocity)", state_interfaces.size());
     return state_interfaces;
@@ -379,6 +385,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
             int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
             joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
 
+            joint_efforts_[i] = 0.0;
             uint8_t status_byte = frame.data[6];
             bool enable = (status_byte & 0x20) != 0;
             bool error = (status_byte & 0x08) != 0;

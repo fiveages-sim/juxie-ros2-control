@@ -62,6 +62,7 @@ private:
     // 电机数据存储（仅位置+速度，移除effort）
     std::vector<double> joint_positions_;     // 实际位置（弧度）
     std::vector<double> joint_velocities_;    // 实际速度（弧度/秒）
+    std::vector<double> joint_efforts_;
     std::vector<double> joint_position_commands_; // 位置命令（弧度）
     std::vector<int16_t> raw_position_commands_;  // 位置命令（电机int16计数）
 
