@@ -81,7 +81,7 @@ private:
     bool initCanFd();                   // 初始化CAN FD接口（启用FD模式）
     bool enableMotors();                // 使能电机
     void controlLoop();                 // 控制线程循环
-    bool readMotorStates();             // 读取所有电机状态
+    bool readMotorStates(bool strict_check);             // 读取所有电机状态
     bool sendMultiMotorCommand();       // 发送多控帧
     bool sendSyncFrame();               // 发送同步帧
 };
