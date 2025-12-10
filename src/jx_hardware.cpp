@@ -39,7 +39,6 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         return hardware_interface::CallbackReturn::ERROR;
     }
 
-
     const auto get_param = [&](const std::string& name, const std::string& default_val) {
         auto it = info_.hardware_parameters.find(name);
         return it != info_.hardware_parameters.end() ? it->second : default_val;
@@ -70,7 +69,16 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
+    
+    // 新增：插值相关变量
+    prev_raw_position_commands_.resize(motor_count, 0);
+    next_raw_position_commands_.resize(motor_count, 0);
+    last_sent_raw_commands_.resize(motor_count, 0);
+    interpolation_alpha_ = 0.0;
+    alpha_increment_ = 0.0;
+    
     running_ = false;
+    is_first_command_ = true;
 
     // 打印初始化信息
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware initialized:");
@@ -97,7 +105,6 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 延时100ms，确保内核完成设备配置
 
-
     return hardware_interface::CallbackReturn::SUCCESS;
 }
 
@@ -112,13 +119,6 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         return hardware_interface::CallbackReturn::ERROR;
     }
 
-    // 使能电机  ///  待定
-    // if (!enableMotors()) {
-    //     RCLCPP_ERROR(get_node()->get_logger(), "Motor enable failed");
-    //     ::close(can_socket_);
-    //     return hardware_interface::CallbackReturn::ERROR;
-    // }
-
     // 发送同步帧→获取初始状态（仅初始化时发送一次）
     sendSyncFrame();
     if (!readMotorStates(true)) { 
@@ -126,14 +126,23 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         ::close(can_socket_);
         return hardware_interface::CallbackReturn::ERROR;
     }
+    
     // 初始化命令缓冲区
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         joint_position_commands_[i] = joint_positions_[i]; // 弧度
         double angle_deg = joint_positions_[i] * 180.0 / M_PI; // 弧度→角度
         raw_position_commands_[i] = angleToInt16(angle_deg); // 角度→电机计数
+        
+        // 初始化插值相关变量
+        prev_raw_position_commands_[i] = raw_position_commands_[i];
+        next_raw_position_commands_[i] = raw_position_commands_[i];
+        last_sent_raw_commands_[i] = raw_position_commands_[i];
     }
+    
+    interpolation_alpha_ = 0.0;
+    alpha_increment_ = 0.0;
 
-    // 5. 启动控制线程
+    // 启动控制线程
     running_ = true;
     control_thread_ = std::thread(&JxHardware::controlLoop, this);
 
@@ -179,7 +188,6 @@ JxHardware::on_export_state_interfaces() {
             std::make_shared<hardware_interface::StateInterface>(
                 joint_name, hardware_interface::HW_IF_EFFORT, &joint_efforts_[i]));
 
-
     }
     RCLCPP_INFO(get_node()->get_logger(), "Exported %zu state interfaces (position+velocity)", state_interfaces.size());
     return state_interfaces;
@@ -207,12 +215,31 @@ hardware_interface::return_type JxHardware::read(
 }
 
 hardware_interface::return_type JxHardware::write(
-    const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
-    // 弧度→角度→电机计数
+    const rclcpp::Time & /* time */, const rclcpp::Duration &period) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // 更新插值相关变量
+    // 上一次实际发送的命令作为插值起点
+    prev_raw_position_commands_ = last_sent_raw_commands_;
+    
+    // 计算新的目标命令
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
-        raw_position_commands_[i] = angleToInt16(angle_deg);
+        next_raw_position_commands_[i] = angleToInt16(angle_deg);
     }
+    
+    // 更新插值系数增量
+    // 控制线程运行在1000Hz，period是ROS2控制器的更新周期
+    double hw_period = period.seconds();
+    if (hw_period > 0) {
+        alpha_increment_ = (control_period_ms_ / 1000.0) / hw_period;
+    } else {
+        alpha_increment_ = 1.0; // 如果period为0，直接使用目标值
+    }
+    
+    // 重置插值系数为0，开始新的插值周期
+    interpolation_alpha_ = 0.0;
+    
     return hardware_interface::return_type::OK;
 }
 
@@ -270,7 +297,6 @@ bool JxHardware::enableMotors() {
     return true;
 }
 
-
 // === 发送同步帧 ===
 bool JxHardware::sendSyncFrame() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -295,6 +321,20 @@ bool JxHardware::sendSyncFrame() {
 // === 发送多控帧（协议0x200，控制多个电机）===
 bool JxHardware::sendMultiMotorCommand() {
     std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    // 更新插值系数
+    interpolation_alpha_ += alpha_increment_;
+    if (interpolation_alpha_ > 1.0) {
+        interpolation_alpha_ = 1.0;
+    }
+    
+    // 线性插值生成当前帧命令
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        raw_position_commands_[i] = prev_raw_position_commands_[i] + 
+                                   interpolation_alpha_ * (next_raw_position_commands_[i] - prev_raw_position_commands_[i]);
+        last_sent_raw_commands_[i] = raw_position_commands_[i];
+    }
+    
     uint8_t data[CANFD_MAX_LEN] = {0};
     uint8_t control_byte = is_first_command_ ? 0xD8 : 0xD0;
 
@@ -325,6 +365,7 @@ bool JxHardware::sendMultiMotorCommand() {
         RCLCPP_ERROR(get_node()->get_logger(), "Multi-motor command failed: %s", strerror(errno));
         return false;
     }
+    
     // 第一次发送后更新标志
     if (is_first_command_) {
         RCLCPP_INFO(get_node()->get_logger(), "Sent first command with control byte 0xD8");
@@ -333,6 +374,7 @@ bool JxHardware::sendMultiMotorCommand() {
 
     return true;
 }
+
 // === 读取电机状态（非阻塞读取+缓存所有反馈）===
 bool JxHardware::readMotorStates(bool strict_check) {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -366,9 +408,6 @@ bool JxHardware::readMotorStates(bool strict_check) {
                             1000, "feedback_map size is,motor ids size is:%d ,%d",feedback_map.size(),motor_ids_.size());
         return false;
     }
-
-
-
 
     // 处理缓存的反馈数据
     for (size_t i = 0; i < motor_ids_.size(); ++i) {

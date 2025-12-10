@@ -16,6 +16,7 @@
 #include <linux/can/raw.h>
 #include <cstdint>
 #include <cmath>
+#include <unordered_map>
 
 namespace juxie_ros2_control {
 class JxHardware : public hardware_interface::SystemInterface {
@@ -52,19 +53,29 @@ private:
     static constexpr int16_t RAW_MIN = -32568;             // 协议定义的最小计数（对应-180度）
     static constexpr int16_t RAW_MAX = 32568;              // 协议定义的最大计数（对应180度）
     static constexpr uint8_t MAX_MOTOR_COUNT = 8;          // 多控帧最多支持8个电机
-    bool is_first_command_ = true;  // 新增：标记是否是第一次发送命令
 
-    // 仅保留必要配置参数
+    // 配置参数
     std::string can_interface_;        // CAN接口名（默认can0）
     std::vector<uint8_t> motor_ids_;   // 电机ID列表（最多8个）
     int control_period_ms_;            // 控制周期（默认1ms）
 
-    // 电机数据存储（仅位置+速度，移除effort）
+    // 状态和命令存储
     std::vector<double> joint_positions_;     // 实际位置（弧度）
     std::vector<double> joint_velocities_;    // 实际速度（弧度/秒）
-    std::vector<double> joint_efforts_;
+    std::vector<double> joint_efforts_;       // 实际力矩
     std::vector<double> joint_position_commands_; // 位置命令（弧度）
     std::vector<int16_t> raw_position_commands_;  // 位置命令（电机int16计数）
+    
+    // 插值相关变量
+    std::vector<int16_t> prev_raw_position_commands_;  // 上一帧命令（插值起点）
+    std::vector<int16_t> next_raw_position_commands_;  // 目标命令（来自ROS2控制器）
+    std::vector<int16_t> last_sent_raw_commands_;      // 上一次实际发送的命令
+    double interpolation_alpha_;                        // 插值系数（0-1）
+    double alpha_increment_;                           // 每次控制循环的alpha增量
+    
+    // 控制标志
+    bool is_first_command_ = true;    // 标记是否是第一次发送命令
+    std::atomic<bool> running_;       // 线程运行标志
 
     // CAN FD通信相关
     int can_socket_;                    // CAN套接字
@@ -74,15 +85,14 @@ private:
 
     // 控制线程相关
     std::thread control_thread_;        // 周期性发送多控帧的线程
-    std::atomic<bool> running_;         // 线程运行标志
 
-    // 辅助函数（角度与电机计数映射，无减速比）
+    // 辅助函数
     int16_t angleToInt16(double angle); // 角度（°）→ 电机int16计数
     double int16ToAngle(int16_t int_val); // 电机int16计数 → 角度（°）
     bool initCanFd();                   // 初始化CAN FD接口（启用FD模式）
     bool enableMotors();                // 使能电机
     void controlLoop();                 // 控制线程循环
-    bool readMotorStates(bool strict_check);             // 读取所有电机状态
+    bool readMotorStates(bool strict_check); // 读取所有电机状态
     bool sendMultiMotorCommand();       // 发送多控帧
     bool sendSyncFrame();               // 发送同步帧
 };
