@@ -57,7 +57,7 @@ private:
     // 配置参数
     std::string can_interface_;        // CAN接口名（默认can0）
     std::vector<uint8_t> motor_ids_;   // 电机ID列表（最多8个）
-    int control_period_ms_;            // 控制周期（默认1ms）
+    float control_period_ms_;            // 控制周期（默认1ms）
 
     // 状态和命令存储
     std::vector<double> joint_positions_;     // 实际位置（弧度）
@@ -93,6 +93,7 @@ private:
     bool enableMotors();                // 使能电机
     void controlLoop();                 // 控制线程循环
     bool readMotorStates(bool strict_check); // 读取所有电机状态
+    void parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame);
     bool sendMultiMotorCommand();       // 发送多控帧
     bool sendSyncFrame();               // 发送同步帧
 };

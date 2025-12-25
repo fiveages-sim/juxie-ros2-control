@@ -46,7 +46,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
 
     // 解析核心参数
     can_interface_ = get_param("can_interface", "can0");
-    control_period_ms_ = std::stoi(get_param("control_period_ms", "1")); // 默认1ms=1000Hz
+    control_period_ms_ = std::stof(get_param("control_period_ms", "1")); // 默认1ms=1000Hz
 
     // 解析电机ID列表
     std::string motor_ids_str = get_param("motor_ids", "");
@@ -70,7 +70,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_position_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
     
-    // 新增：插值相关变量
+    // 插值相关变量
     prev_raw_position_commands_.resize(motor_count, 0);
     next_raw_position_commands_.resize(motor_count, 0);
     last_sent_raw_commands_.resize(motor_count, 0);
@@ -83,7 +83,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     // 打印初始化信息
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware initialized:");
     RCLCPP_INFO(get_node()->get_logger(), "  CAN Interface: %s", can_interface_.c_str());
-    RCLCPP_INFO(get_node()->get_logger(), "  Control Period: %d ms", control_period_ms_);
+    RCLCPP_INFO(get_node()->get_logger(), "  Control Period: %.2f ms", control_period_ms_);
     RCLCPP_INFO(get_node()->get_logger(), "  Motor IDs (count: %zu):", motor_ids_.size());
 
     for (uint8_t id : motor_ids_) {
@@ -210,9 +210,20 @@ JxHardware::on_export_command_interfaces() {
 // === ROS2 Control 读写接口 ===
 hardware_interface::return_type JxHardware::read(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
-    readMotorStates(false); 
-    return hardware_interface::return_type::OK;
+    if (!readMotorStates(false))
+    {
+        RCLCPP_ERROR(get_node()->get_logger(), "motor error ,return");
+        return hardware_interface::return_type::ERROR;
+    }
+    else
+    {
+        return hardware_interface::return_type::OK;
+    }
+
 }
+
+
+
 
 hardware_interface::return_type JxHardware::write(
     const rclcpp::Time & /* time */, const rclcpp::Duration &period) {
@@ -232,9 +243,10 @@ hardware_interface::return_type JxHardware::write(
     // 控制线程运行在1000Hz，period是ROS2控制器的更新周期
     double hw_period = period.seconds();
     if (hw_period > 0) {
+        // 使用浮点数除法
         alpha_increment_ = (control_period_ms_ / 1000.0) / hw_period;
     } else {
-        alpha_increment_ = 1.0; // 如果period为0，直接使用目标值
+        alpha_increment_ = 1.0;
     }
     
     // 重置插值系数为0，开始新的插值周期
@@ -375,7 +387,7 @@ bool JxHardware::sendMultiMotorCommand() {
     return true;
 }
 
-// === 读取电机状态（非阻塞读取+缓存所有反馈）===
+// === 读取电机状态（非阻塞读取+缓存所有反馈）+ 错误处理 ===
 bool JxHardware::readMotorStates(bool strict_check) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     struct timeval timeout = {0, 1000}; // 缩短超时到1ms，避免阻塞
@@ -383,6 +395,9 @@ bool JxHardware::readMotorStates(bool strict_check) {
 
     // 创建临时映射表存储最新反馈
     std::unordered_map<uint8_t, canfd_frame> feedback_map;
+    // 存储错误帧的映射表
+    std::unordered_map<uint8_t, canfd_frame> error_frames_map;
+    
     struct canfd_frame frame;
     
     // 读取所有可用的CAN帧
@@ -392,7 +407,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
             break; // 无数据或超时
         }
 
-        // 检查是否是目标电机的反馈帧
+        // 检查是否是目标电机的反馈帧 (ID: 0x300+执行器ID)
         if (frame.can_id >= SINGLE_FEEDBACK_BASE && frame.can_id < SINGLE_FEEDBACK_BASE + 256) {
             uint8_t motor_id = frame.can_id - SINGLE_FEEDBACK_BASE;
             // 只缓存我们关心的电机反馈
@@ -400,12 +415,26 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 feedback_map[motor_id] = frame; // 更新最新反馈
             }
         }
+        // 检查是否是紧急错误帧 (ID: 0x80+执行器ID)
+        else if (frame.can_id >= 0x80 && frame.can_id < 0x80 + 256) {
+            uint8_t motor_id = frame.can_id - 0x80;
+            // 只处理我们关心的电机错误
+            if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
+                error_frames_map[motor_id] = frame; // 存储错误帧
+                
+                // 立即解析并输出错误信息
+                parseAndReportEmergencyFrame(motor_id, frame);
+                running_ = false;
+                return false;
+
+            }
+        }
     }
 
-    if(feedback_map.size()!=motor_ids_.size() && strict_check )
-    {
+    if(feedback_map.size() != motor_ids_.size() && strict_check) {
         RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                            1000, "feedback_map size is,motor ids size is:%d ,%d",feedback_map.size(),motor_ids_.size());
+                            1000, "feedback_map size is %zu, motor ids size is: %zu", 
+                            feedback_map.size(), motor_ids_.size());
         return false;
     }
 
@@ -436,6 +465,8 @@ bool JxHardware::readMotorStates(bool strict_check) {
             if (error) {
                 RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                     1000, "Motor %d has error, error code: 0x%02X", id, status_byte);
+                running_ = false;
+                return false;
             }
         } else {
             RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
@@ -446,21 +477,74 @@ bool JxHardware::readMotorStates(bool strict_check) {
     return true;
 }
 
+// === 解析并报告紧急错误帧 ===
+void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame) {
+    // 确保数据长度足够
+    if (frame.len < 2) {
+        RCLCPP_WARN(get_node()->get_logger(), 
+                   "Emergency frame for motor %d has insufficient data length: %d", 
+                   motor_id, frame.len);
+        return;
+    }
+    
+    uint8_t error_byte0 = frame.data[0];
+    uint8_t error_byte1 = frame.data[1];
+    
+    std::vector<std::string> error_messages;
+    
+    // 解析第一个字节的错误位
+    if (error_byte0 & 0x80) error_messages.push_back("负限位保护");
+    if (error_byte0 & 0x40) error_messages.push_back("正限位保护");
+    if (error_byte0 & 0x20) error_messages.push_back("超过最大速度");
+    if (error_byte0 & 0x10) error_messages.push_back("过载");
+    if (error_byte0 & 0x08) error_messages.push_back("堵转");
+    if (error_byte0 & 0x04) error_messages.push_back("过温");
+    if (error_byte0 & 0x02) error_messages.push_back("欠压");
+    if (error_byte0 & 0x01) error_messages.push_back("过压");
+    
+    // 解析第二个字节的错误位
+    if (error_byte1 & 0x08) error_messages.push_back("CAN通信故障");
+    if (error_byte1 & 0x04) error_messages.push_back("相电流采样故障");
+    if (error_byte1 & 0x02) error_messages.push_back("位置跃迁过大故障");
+    if (error_byte1 & 0x01) error_messages.push_back("绝对值编码器故障");
+    
+    // 如果有错误，输出日志
+    if (!error_messages.empty()) {
+        std::string error_str = "Motor " + std::to_string(motor_id) + " emergency errors: ";
+        for (size_t i = 0; i < error_messages.size(); ++i) {
+            error_str += error_messages[i];
+            if (i < error_messages.size() - 1) {
+                error_str += ", ";
+            }
+        }
+        RCLCPP_ERROR(get_node()->get_logger(), "%s (SEVERE)", error_str.c_str());
+
+    }
+}
 // === 控制线程：周期性发送多控帧 ===
 void JxHardware::controlLoop() {
-    RCLCPP_INFO(get_node()->get_logger(), "Control thread started (period: %d ms)", control_period_ms_);
-    auto period = std::chrono::milliseconds(control_period_ms_);
+    RCLCPP_INFO(get_node()->get_logger(), "Control thread started (period: %.2f ms)", control_period_ms_);
+    auto period = std::chrono::microseconds(static_cast<int>(control_period_ms_ * 1000));
     auto next_time = std::chrono::steady_clock::now() + period;
 
     while (running_) {
         sendMultiMotorCommand();
+        
+        // 精确睡眠到下一个时间点
         std::this_thread::sleep_until(next_time);
         next_time += period;
+        
+        // 防止累积误差
+        auto now = std::chrono::steady_clock::now();
+        if (next_time < now) {
+            // 如果落后了，调整到下个周期
+            next_time = now + period;
     }
-    RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
 }
+    RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
 
 } // namespace juxie_ros2_control
 
 // 导出插件
 PLUGINLIB_EXPORT_CLASS(juxie_ros2_control::JxHardware, hardware_interface::SystemInterface)
+}
