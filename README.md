@@ -103,7 +103,7 @@ your_username ALL=(ALL) NOPASSWD: /sbin/ip link set can0 down, /sbin/ip link set
 
 ```
 
-**示例**（如果用户名为 `fa`，设备名称为 `can100`）：
+**示例**（如果用户名为 `fa`，设备名称为 `can0`）：
 ```
 fa ALL=(ALL) NOPASSWD: /sbin/ip link set can0 down, /sbin/ip link set can0 up type can bitrate * dbitrate * fd on
 ```
