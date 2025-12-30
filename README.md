@@ -88,11 +88,25 @@ source install/setup.bash
 
 ### 2. 配置 CAN 接口
 
-在使用前，确保 CAN 接口已正确配置。硬件接口会自动配置 CAN FD（1Mbps/5Mbps），但需要确保：
+#### 配置步骤
 
-1. CAN 接口已连接并可用
-2. 具有配置 CAN 接口的权限（可能需要 sudo）
+1. **编辑 sudoers 文件**
 
+```bash
+sudo visudo
+```
+
+2. **添加以下行**（将 `your_username` 替换为你的实际用户名，将 `can0` 为默认配置的设备名称）
+
+```
+your_username ALL=(ALL) NOPASSWD: /sbin/ip link set can0 down, /sbin/ip link set can0 up type can bitrate * dbitrate * fd on
+
+```
+
+**示例**（如果用户名为 `fa`，设备名称为 `can100`）：
+```
+fa ALL=(ALL) NOPASSWD: /sbin/ip link set can0 down, /sbin/ip link set can0 up type can bitrate * dbitrate * fd on
+```
 ### 3. 启动控制器
 
 使用标准的 ROS2 Control 控制器（如 `joint_trajectory_controller`）：
