@@ -69,7 +69,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
-    
+
     // 插值相关变量
     prev_raw_position_commands_.resize(motor_count, 0);
     next_raw_position_commands_.resize(motor_count, 0);
@@ -223,37 +223,44 @@ hardware_interface::return_type JxHardware::read(
 }
 
 
-
-
 hardware_interface::return_type JxHardware::write(
     const rclcpp::Time & /* time */, const rclcpp::Duration &period) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     
-    // 更新插值相关变量
-    // 上一次实际发送的命令作为插值起点
-    prev_raw_position_commands_ = last_sent_raw_commands_;
-    
-    // 计算新的目标命令
+    // 检查命令是否发生变化
+    bool command_changed = false;
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
-        double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
-        next_raw_position_commands_[i] = angleToInt16(angle_deg);
+        double angle_deg = joint_position_commands_[i] *  180.0 / M_PI;
+        int16_t new_raw = angleToInt16(angle_deg);
+        
+        // 比较新的命令值与上一次的目标命令值
+        if (new_raw != next_raw_position_commands_[i]) {
+            command_changed = true;
+            next_raw_position_commands_[i] = new_raw;
+        }
     }
     
-    // 更新插值系数增量
-    // 控制线程运行在1000Hz，period是ROS2控制器的更新周期
-    double hw_period = period.seconds();
-    if (hw_period > 0) {
-        // 使用浮点数除法
-        alpha_increment_ = (control_period_ms_ / 1000.0) / hw_period;
+    // 只有命令发生变化时才发送
+    if (command_changed) {
+        command_pending_ = true;
+        
+        // 重置插值
+        prev_raw_position_commands_ = last_sent_raw_commands_;
+        interpolation_alpha_ = 0.0;
+        
+        if (period.seconds() > 0) {
+            alpha_increment_ = (control_period_ms_ / 1000.0) / period.seconds();
+        } else {
+            alpha_increment_ = 1.0;
+        }
     } else {
-        alpha_increment_ = 1.0;
+        // 命令没有变化，不发送
+        command_pending_ = false;
     }
-    
-    // 重置插值系数为0，开始新的插值周期
-    interpolation_alpha_ = 0.0;
     
     return hardware_interface::return_type::OK;
 }
+
 
 // === CAN FD初始化（启用FD模式）===
 bool JxHardware::initCanFd() {
@@ -521,29 +528,28 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
 
     }
 }
-// === 控制线程：周期性发送多控帧 ===
 void JxHardware::controlLoop() {
     RCLCPP_INFO(get_node()->get_logger(), "Control thread started (period: %.2f ms)", control_period_ms_);
     auto period = std::chrono::microseconds(static_cast<int>(control_period_ms_ * 1000));
     auto next_time = std::chrono::steady_clock::now() + period;
 
     while (running_) {
-        sendMultiMotorCommand();
+        // 只在有命令时发送
+        if (command_pending_) {
+            sendMultiMotorCommand();
+        }
         
-        // 精确睡眠到下一个时间点
+        // 依然保持定时唤醒，但只在有命令时工作
         std::this_thread::sleep_until(next_time);
         next_time += period;
         
-        // 防止累积误差
-        auto now = std::chrono::steady_clock::now();
-        if (next_time < now) {
-            // 如果落后了，调整到下个周期
-            next_time = now + period;
+        if (next_time < std::chrono::steady_clock::now()) {
+            next_time = std::chrono::steady_clock::now() + period;
+        }
     }
 }
-    RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
 
-} // namespace juxie_ros2_control
+ // namespace juxie_ros2_control
 
 // 导出插件
 PLUGINLIB_EXPORT_CLASS(juxie_ros2_control::JxHardware, hardware_interface::SystemInterface)
