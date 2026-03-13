@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cmath>
 #include <unordered_map>
+#include <std_msgs/msg/int64.hpp>
 
 namespace juxie_ros2_control {
 class JxHardware : public hardware_interface::SystemInterface {
@@ -85,6 +86,8 @@ private:
 
     // 控制线程相关
     std::thread control_thread_;        // 周期性发送多控帧的线程
+    // 异常发布相关
+    rclcpp::Publisher<std_msgs::msg::Int64>::SharedPtr error_pub_;
 
     // 辅助函数
     int16_t angleToInt16(double angle); // 角度（°）→ 电机int16计数
