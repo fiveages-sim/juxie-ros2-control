@@ -43,7 +43,8 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         auto it = info_.hardware_parameters.find(name);
         return it != info_.hardware_parameters.end() ? it->second : default_val;
     };
-
+    error_pub_ = get_node()->create_publisher<std_msgs::msg::Int64>("/Base_HardwareError", 10);
+    RCLCPP_INFO(get_node()->get_logger(), "Error publisher created on /Base_HardwareError");
     // 解析核心参数
     can_interface_ = get_param("can_interface", "can0");
     control_period_ms_ = std::stof(get_param("control_period_ms", "1")); // 默认1ms=1000Hz
@@ -432,6 +433,13 @@ bool JxHardware::readMotorStates(bool strict_check) {
     }
 
     if(feedback_map.size() != motor_ids_.size() && strict_check) {
+        if (error_pub_) {
+            std_msgs::msg::Int64 msg;
+            msg.data = static_cast<int64_t>(0x300200);
+            error_pub_->publish(msg);
+            RCLCPP_INFO(get_node()->get_logger(), "Published hardware error: 0x%06X", 0x300200);
+        }
+
         RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                             1000, "feedback_map size is %zu, motor ids size is: %zu", 
                             feedback_map.size(), motor_ids_.size());
@@ -481,34 +489,88 @@ bool JxHardware::readMotorStates(bool strict_check) {
 void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame) {
     // 确保数据长度足够
     if (frame.len < 2) {
-        RCLCPP_WARN(get_node()->get_logger(), 
-                   "Emergency frame for motor %d has insufficient data length: %d", 
+        RCLCPP_WARN(get_node()->get_logger(),
+                   "Emergency frame for motor %d has insufficient data length: %d",
                    motor_id, frame.len);
         return;
     }
-    
+
     uint8_t error_byte0 = frame.data[0];
     uint8_t error_byte1 = frame.data[1];
-    
+
     std::vector<std::string> error_messages;
-    
-    // 解析第一个字节的错误位
-    if (error_byte0 & 0x80) error_messages.push_back("负限位保护");
-    if (error_byte0 & 0x40) error_messages.push_back("正限位保护");
-    if (error_byte0 & 0x20) error_messages.push_back("超过最大速度");
-    if (error_byte0 & 0x10) error_messages.push_back("过载");
-    if (error_byte0 & 0x08) error_messages.push_back("堵转");
-    if (error_byte0 & 0x04) error_messages.push_back("过温");
-    if (error_byte0 & 0x02) error_messages.push_back("欠压");
-    if (error_byte0 & 0x01) error_messages.push_back("过压");
-    
-    // 解析第二个字节的错误位
-    if (error_byte1 & 0x08) error_messages.push_back("CAN通信故障");
-    if (error_byte1 & 0x04) error_messages.push_back("相电流采样故障");
-    if (error_byte1 & 0x02) error_messages.push_back("位置跃迁过大故障");
-    if (error_byte1 & 0x01) error_messages.push_back("绝对值编码器故障");
-    
-    // 如果有错误，输出日志
+    bool any_error = false;
+
+    // 定义错误位到故障码的映射
+    struct ErrorBitMap {
+        uint8_t byte;      // 0 表示 error_byte0，1 表示 error_byte1
+        uint8_t bit;       // 位掩码
+        uint16_t fault_code; // 故障码低16位
+    };
+
+    // 映射表（按顺序对应表中的故障）
+    std::vector<ErrorBitMap> error_map = {
+        {0, 0x80, 0x0001}, // 负限位保护
+        {0, 0x40, 0x0002}, // 正限位保护
+        {0, 0x20, 0x0003}, // 超过最大速度
+        {0, 0x10, 0x0004}, // 过载
+        {0, 0x08, 0x0005}, // 堵转
+        {0, 0x04, 0x0006}, // 过温
+        {0, 0x02, 0x0007}, // 欠压
+        {0, 0x01, 0x0008}, // 过压
+        {1, 0x08, 0x0009}, // CAN通信故障
+        {1, 0x04, 0x000A}, // 相电流采样故障
+        {1, 0x02, 0x000B}, // 位置跃迁过大故障
+        {1, 0x01, 0x000C}  // 绝对值编码器故障
+    };
+
+    // 遍历映射表，检测每个错误位
+    for (const auto& mapping : error_map) {
+        uint8_t byte = (mapping.byte == 0) ? error_byte0 : error_byte1;
+        if (byte & mapping.bit) {
+            any_error = true;
+
+            // 组装错误码：0x3 << 24 | (motor_id << 16) | fault_code
+            uint32_t error_code = (0x3 << 24) | (motor_id << 16) | mapping.fault_code;
+
+            // 发布错误
+            if (error_pub_) {
+                std_msgs::msg::Int64 msg;
+                msg.data = static_cast<int64_t>(error_code);
+                error_pub_->publish(msg);
+                RCLCPP_INFO(get_node()->get_logger(), "Published hardware error: 0x%06X", error_code);
+            }
+
+            // 记录错误信息（用于后续日志）
+            switch (mapping.fault_code) {
+                case 0x0001: error_messages.push_back("负限位保护"); break;
+                case 0x0002: error_messages.push_back("正限位保护"); break;
+                case 0x0003: error_messages.push_back("超过最大速度"); break;
+                case 0x0004: error_messages.push_back("过载"); break;
+                case 0x0005: error_messages.push_back("堵转"); break;
+                case 0x0006: error_messages.push_back("过温"); break;
+                case 0x0007: error_messages.push_back("欠压"); break;
+                case 0x0008: error_messages.push_back("过压"); break;
+                case 0x0009: error_messages.push_back("CAN通信故障"); break;
+                case 0x000A: error_messages.push_back("相电流采样故障"); break;
+                case 0x000B: error_messages.push_back("位置跃迁过大故障"); break;
+                case 0x000C: error_messages.push_back("绝对值编码器故障"); break;
+            }
+        }
+    }
+
+    // 如果检测到紧急帧但没有任何已知错误位，发布未知错误（0x300100）
+    if (!any_error) {
+        uint32_t error_code = (0x3 << 24) | (motor_id << 16) | 0x0100; // 未知错误
+        if (error_pub_) {
+            std_msgs::msg::Int64 msg;
+            msg.data = static_cast<int64_t>(error_code);
+            error_pub_->publish(msg);
+            RCLCPP_WARN(get_node()->get_logger(), "Published unknown hardware error: 0x%06X", error_code);
+        }
+        error_messages.push_back("未知错误");
+    }
+
     if (!error_messages.empty()) {
         std::string error_str = "Motor " + std::to_string(motor_id) + " emergency errors: ";
         for (size_t i = 0; i < error_messages.size(); ++i) {
@@ -518,9 +580,9 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
             }
         }
         RCLCPP_ERROR(get_node()->get_logger(), "%s (SEVERE)", error_str.c_str());
-
     }
 }
+
 // === 控制线程：周期性发送多控帧 ===
 void JxHardware::controlLoop() {
     RCLCPP_INFO(get_node()->get_logger(), "Control thread started (period: %.2f ms)", control_period_ms_);
