@@ -27,8 +27,8 @@ jobs:
   build-deb:
     runs-on: ubuntu-24.04
     env:
-      PACKAGE_NAME: juxie-ros2-control-jazzy
-      DEB_FILE_PREFIX: juxie-ros2-control-jazzy
+      PACKAGE_NAME: ros-jazzy-juxie-ros2-control
+      DEB_FILE_PREFIX: ros-jazzy-juxie-ros2-control
       ROS_PKG: juxie_ros2_control
       DEFAULT_ROS_DISTRO: jazzy
 
