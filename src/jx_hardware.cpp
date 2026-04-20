@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstring>
 #include <cerrno>
+#include <fcntl.h>
+#include <poll.h>
 
 namespace juxie_ros2_control {
 
@@ -287,7 +289,15 @@ bool JxHardware::initCanFd() {
         return false;
     }
 
-    RCLCPP_INFO(get_node()->get_logger(), "CAN FD initialized: %s (1M/5M)", can_interface_.c_str());
+    // 将 socket 设为非阻塞，避免 read() 在无数据时阻塞到超时，造成 CM 实时循环 Overrun
+    int flags = ::fcntl(can_socket_, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(can_socket_, F_SETFL, flags | O_NONBLOCK) < 0) {
+        RCLCPP_ERROR(get_node()->get_logger(), "CAN set non-blocking failed: %s", strerror(errno));
+        ::close(can_socket_);
+        return false;
+    }
+
+    RCLCPP_INFO(get_node()->get_logger(), "CAN FD initialized: %s (1M/5M, non-blocking)", can_interface_.c_str());
     return true;
 }
 
@@ -391,45 +401,62 @@ bool JxHardware::sendMultiMotorCommand() {
 // === 读取电机状态（非阻塞读取+缓存所有反馈）+ 错误处理 ===
 bool JxHardware::readMotorStates(bool strict_check) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    struct timeval timeout = {0, 1000}; // 缩短超时到1ms，避免阻塞
-    ::setsockopt(can_socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
     // 创建临时映射表存储最新反馈
     std::unordered_map<uint8_t, canfd_frame> feedback_map;
     // 存储错误帧的映射表
     std::unordered_map<uint8_t, canfd_frame> error_frames_map;
-    
+
     struct canfd_frame frame;
-    
-    // 读取所有可用的CAN帧
-    while (true) {
-        ssize_t nbytes = ::read(can_socket_, &frame, sizeof(frame));
-        if (nbytes <= 0) {
-            break; // 无数据或超时
-        }
 
-        // 检查是否是目标电机的反馈帧 (ID: 0x300+执行器ID)
-        if (frame.can_id >= SINGLE_FEEDBACK_BASE && frame.can_id < SINGLE_FEEDBACK_BASE + 256) {
-            uint8_t motor_id = frame.can_id - SINGLE_FEEDBACK_BASE;
-            // 只缓存我们关心的电机反馈
-            if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
-                feedback_map[motor_id] = frame; // 更新最新反馈
+    // strict_check（仅 on_activate 首次读）：同步帧发出后反馈可能尚未到达，非阻塞 read 会立刻空返回。
+    // 在此模式下轮询等待收齐所有电机反馈；正常运行 read(false) 仍只 drain 一次，不拖 CM 周期。
+    const auto strict_deadline =
+        strict_check ? (std::chrono::steady_clock::now() + std::chrono::milliseconds(200))
+                     : std::chrono::steady_clock::now();
+
+    for (;;) {
+        // 读取当前 RX 队列中所有可用帧（非阻塞，无数据即退出内层循环）
+        while (true) {
+            ssize_t nbytes = ::read(can_socket_, &frame, sizeof(frame));
+            if (nbytes <= 0) {
+                if (nbytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                          1000, "CAN read error: %s", strerror(errno));
+                }
+                break;
+            }
+
+            // 检查是否是目标电机的反馈帧 (ID: 0x300+执行器ID)
+            if (frame.can_id >= SINGLE_FEEDBACK_BASE && frame.can_id < SINGLE_FEEDBACK_BASE + 256) {
+                uint8_t motor_id = frame.can_id - SINGLE_FEEDBACK_BASE;
+                if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
+                    feedback_map[motor_id] = frame;
+                }
+            } else if (frame.can_id >= 0x80 && frame.can_id < 0x80 + 256) {
+                uint8_t motor_id = frame.can_id - 0x80;
+                if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
+                    error_frames_map[motor_id] = frame;
+                    parseAndReportEmergencyFrame(motor_id, frame);
+                    running_ = false;
+                    return false;
+                }
             }
         }
-        // 检查是否是紧急错误帧 (ID: 0x80+执行器ID)
-        else if (frame.can_id >= 0x80 && frame.can_id < 0x80 + 256) {
-            uint8_t motor_id = frame.can_id - 0x80;
-            // 只处理我们关心的电机错误
-            if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
-                error_frames_map[motor_id] = frame; // 存储错误帧
-                
-                // 立即解析并输出错误信息
-                parseAndReportEmergencyFrame(motor_id, frame);
-                running_ = false;
-                return false;
 
-            }
+        if (!strict_check) {
+            break;
         }
+        if (feedback_map.size() >= motor_ids_.size()) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= strict_deadline) {
+            break;
+        }
+        struct pollfd pfd = {};
+        pfd.fd = can_socket_;
+        pfd.events = POLLIN;
+        (void)::poll(&pfd, 1, 2);
     }
 
     if(feedback_map.size() != motor_ids_.size() && strict_check) {
