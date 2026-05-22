@@ -17,11 +17,11 @@ int16_t JxHardware::angleToInt16(double angle) {
     // 计算角度在范围内的比例（0~1）
     double ratio = (clamped_angle - ANGLE_MIN) / (ANGLE_MAX - ANGLE_MIN);
     
-    // 将比例映射到协议定义的计数范围[-32568, 32568]
+    // === 新协议适配 START: CSP位置范围[-32668, 32668]对应[-180°, 180°] ===
     int32_t raw_value = RAW_MIN + ratio * (RAW_MAX - RAW_MIN);
-    
-    // 确保结果在协议范围内（防止计算误差）
-    return static_cast<int16_t>(std::clamp(raw_value, (int32_t)RAW_MIN, (int32_t)RAW_MAX));
+    int32_t clamped_raw = std::clamp(raw_value, (int32_t)RAW_MIN, (int32_t)RAW_MAX);
+    // === 新协议适配 END ===
+    return static_cast<int16_t>(clamped_raw);
 }
 
 double JxHardware::int16ToAngle(int16_t int_val) {
@@ -128,7 +128,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         RCLCPP_ERROR(get_node()->get_logger(), "Incomplete motor state initialization");
         ::close(can_socket_);
         return hardware_interface::CallbackReturn::ERROR;
-    }
+    }   
     
     // 初始化命令缓冲区
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
@@ -359,18 +359,23 @@ bool JxHardware::sendMultiMotorCommand() {
     }
     
     uint8_t data[CANFD_MAX_LEN] = {0};
-    uint8_t control_byte = is_first_command_ ? 0xD8 : 0xD0;
+    // === 新协议适配 START: CSP循环同步位置模式控制字 ===
+    // Bit[7]=上使能，Bit[6]=抱闸释放，Bit[5]=清错，Bit[4:1]=0x03(CSP)，Bit[0]预留。
+    uint8_t control_byte = is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP;
+    // === 新协议适配 END ===
 
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         int pkg_offset = i * 7;
-        data[pkg_offset + 0] = control_byte; // 控制位：ENABLE=1、BRAKE=1、MODE=位置模式
+        // === 新协议适配 START: 单个控制分包与新版单轴控制报文保持一致 ===
+        data[pkg_offset + 0] = control_byte; // 控制位：ENABLE=1、BRAKE=1、MODE=CSP位置模式
         data[pkg_offset + 1] = (raw_position_commands_[i] >> 8) & 0xFF; // 位置高字节
         data[pkg_offset + 2] = raw_position_commands_[i] & 0xFF;        // 位置低字节
-        data[pkg_offset + 3] = 0x00; // TC=0（位置模式无需电流前馈）
+        data[pkg_offset + 3] = 0x00; // 目标参数2，CSP模式下不使用
         data[pkg_offset + 4] = 0x00;
-        data[pkg_offset + 5] = 0x00; // TFC=0
+        data[pkg_offset + 5] = 0x00; // 目标前馈参数，CSP模式下不使用
         data[pkg_offset + 6] = 0x00;
+        // === 新协议适配 END ===
     }
 
     // 填充56-63字节：电机ID
@@ -391,7 +396,7 @@ bool JxHardware::sendMultiMotorCommand() {
     
     // 第一次发送后更新标志
     if (is_first_command_) {
-        RCLCPP_INFO(get_node()->get_logger(), "Sent first command with control byte 0xD8");
+        RCLCPP_INFO(get_node()->get_logger(), "Sent first CSP command with control byte 0x%02X", control_byte);
         is_first_command_ = false;
     }
 
@@ -479,8 +484,14 @@ bool JxHardware::readMotorStates(bool strict_check) {
         auto it = feedback_map.find(id);
         
         if (it != feedback_map.end()) {
-            // 解析数据
+            // === 新协议适配 START: 反馈帧按新版12字节格式解析 ===
             const canfd_frame& frame = it->second;
+            if (frame.len < 12) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                   1000, "Feedback for motor %d has insufficient data length: %d", id, frame.len);
+                continue;
+            }
+
             int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
             double angle_deg = int16ToAngle(raw_pos);
             joint_positions_[i] = angle_deg * M_PI / 180.0;
@@ -488,21 +499,35 @@ bool JxHardware::readMotorStates(bool strict_check) {
             int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
             joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
 
-            joint_efforts_[i] = 0.0;
-            uint8_t status_byte = frame.data[6];
-            bool enable = (status_byte & 0x20) != 0;
-            bool error = (status_byte & 0x08) != 0;
+            int16_t raw_current = (frame.data[4] << 8) | frame.data[5];
+            joint_efforts_[i] = static_cast<double>(raw_current); // 新协议反馈Iq电流，单位mA
+
+            uint16_t error_code = (frame.data[6] << 8) | frame.data[7];
+            uint8_t mode_feedback = frame.data[10];
+            uint8_t status_byte = frame.data[11];
+            bool enable = (status_byte & 0x80) != 0;
+            bool error = (status_byte & 0x20) != 0 || error_code != 0;
 
             if (!enable) {
                 RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 
                                    5000, "Motor %d is not enabled", id);
             }
+            if (mode_feedback != 0x03) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
+                                    5000, "Motor %d mode feedback is 0x%02X, expected CSP(0x03)",
+                                    id, mode_feedback);
+            }
             if (error) {
+                if (error_code != 0) {
+                    parseAndReportErrorCode(id, error_code, "feedback frame");
+                }
                 RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                    1000, "Motor %d has error, error code: 0x%02X", id, status_byte);
+                                    1000, "Motor %d has error, error code: 0x%04X, status: 0x%02X",
+                                    id, error_code, status_byte);
                 running_ = false;
                 return false;
             }
+            // === 新协议适配 END ===
         } else {
             RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                 1000, "No feedback for motor %d", id);
@@ -512,49 +537,37 @@ bool JxHardware::readMotorStates(bool strict_check) {
     return true;
 }
 
-// === 解析并报告紧急错误帧 ===
-void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame) {
-    // 确保数据长度足够
-    if (frame.len < 2) {
-        RCLCPP_WARN(get_node()->get_logger(),
-                   "Emergency frame for motor %d has insufficient data length: %d",
-                   motor_id, frame.len);
-        return;
-    }
-
-    uint8_t error_byte0 = frame.data[0];
-    uint8_t error_byte1 = frame.data[1];
-
+// === 新协议适配 START: 解析并发布新版16bit错误码 ===
+void JxHardware::parseAndReportErrorCode(uint8_t motor_id, uint16_t error_code_raw, const std::string& source) {
     std::vector<std::string> error_messages;
     bool any_error = false;
 
-    // 定义错误位到故障码的映射
     struct ErrorBitMap {
-        uint8_t byte;      // 0 表示 error_byte0，1 表示 error_byte1
-        uint8_t bit;       // 位掩码
+        uint16_t bit;        // 新协议故障位
         uint16_t fault_code; // 故障码低16位
+
+        const char* message;
     };
 
-    // 映射表（按顺序对应表中的故障）
     std::vector<ErrorBitMap> error_map = {
-        {0, 0x80, 0x0001}, // 负限位保护
-        {0, 0x40, 0x0002}, // 正限位保护
-        {0, 0x20, 0x0003}, // 超过最大速度
-        {0, 0x10, 0x0004}, // 过载
-        {0, 0x08, 0x0005}, // 堵转
-        {0, 0x04, 0x0006}, // 过温
-        {0, 0x02, 0x0007}, // 欠压
-        {0, 0x01, 0x0008}, // 过压
-        {1, 0x08, 0x0009}, // CAN通信故障
-        {1, 0x04, 0x000A}, // 相电流采样故障
-        {1, 0x02, 0x000B}, // 位置跃迁过大故障
-        {1, 0x01, 0x000C}  // 绝对值编码器故障
+        {0x0001, 0x0001, "过压"},
+        {0x0002, 0x0002, "欠压"},
+        {0x0004, 0x0003, "过温报错"},
+        {0x0008, 0x0004, "堵转"},
+        {0x0010, 0x0005, "过载"},
+        {0x0020, 0x0006, "电流采样错误"},
+        {0x0040, 0x0007, "正限位保护"},
+        {0x0080, 0x0008, "负限位保护"},
+        {0x0100, 0x0009, "编码器通信超时"},
+        {0x0200, 0x000A, "电机超过最大速度"},
+        {0x0400, 0x000B, "上电电角度初始化失败"},
+        {0x1000, 0x000C, "位置误差过大"},
+        {0x2000, 0x000D, "编码器故障"}
     };
 
     // 遍历映射表，检测每个错误位
     for (const auto& mapping : error_map) {
-        uint8_t byte = (mapping.byte == 0) ? error_byte0 : error_byte1;
-        if (byte & mapping.bit) {
+        if (error_code_raw & mapping.bit) {
             any_error = true;
 
             // 组装错误码：0x3 << 24 | (motor_id << 16) | fault_code
@@ -568,21 +581,7 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
                 RCLCPP_INFO(get_node()->get_logger(), "Published hardware error: 0x%06X", error_code);
             }
 
-            // 记录错误信息（用于后续日志）
-            switch (mapping.fault_code) {
-                case 0x0001: error_messages.push_back("负限位保护"); break;
-                case 0x0002: error_messages.push_back("正限位保护"); break;
-                case 0x0003: error_messages.push_back("超过最大速度"); break;
-                case 0x0004: error_messages.push_back("过载"); break;
-                case 0x0005: error_messages.push_back("堵转"); break;
-                case 0x0006: error_messages.push_back("过温"); break;
-                case 0x0007: error_messages.push_back("欠压"); break;
-                case 0x0008: error_messages.push_back("过压"); break;
-                case 0x0009: error_messages.push_back("CAN通信故障"); break;
-                case 0x000A: error_messages.push_back("相电流采样故障"); break;
-                case 0x000B: error_messages.push_back("位置跃迁过大故障"); break;
-                case 0x000C: error_messages.push_back("绝对值编码器故障"); break;
-            }
+            error_messages.push_back(mapping.message);
         }
     }
 
@@ -599,15 +598,30 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
     }
 
     if (!error_messages.empty()) {
-        std::string error_str = "Motor " + std::to_string(motor_id) + " emergency errors: ";
+        std::string error_str = "Motor " + std::to_string(motor_id) + " " + source + " errors: ";
         for (size_t i = 0; i < error_messages.size(); ++i) {
             error_str += error_messages[i];
             if (i < error_messages.size() - 1) {
                 error_str += ", ";
             }
         }
-        RCLCPP_ERROR(get_node()->get_logger(), "%s (SEVERE)", error_str.c_str());
+        RCLCPP_ERROR(get_node()->get_logger(), "%s (raw: 0x%04X, SEVERE)", error_str.c_str(), error_code_raw);
     }
+}
+// === 新协议适配 END ===
+
+// === 解析并报告紧急错误帧 ===
+void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame) {
+    // 确保数据长度足够
+    if (frame.len < 2) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                   "Emergency frame for motor %d has insufficient data length: %d",
+                   motor_id, frame.len);
+        return;
+    }
+
+    uint16_t error_code_raw = (frame.data[0] << 8) | frame.data[1];
+    parseAndReportErrorCode(motor_id, error_code_raw, "emergency frame");
 }
 
 // === 控制线程：周期性发送多控帧 ===

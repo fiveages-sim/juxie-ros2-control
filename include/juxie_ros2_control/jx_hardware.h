@@ -51,8 +51,16 @@ private:
     static constexpr int CANFD_MAX_LEN = 64;               // CAN FD最大数据长度
     static constexpr double ANGLE_MIN = -180.0;            // 电机角度范围
     static constexpr double ANGLE_MAX = 180.0;
-    static constexpr int16_t RAW_MIN = -32568;             // 协议定义的最小计数（对应-180度）
-    static constexpr int16_t RAW_MAX = 32568;              // 协议定义的最大计数（对应180度）
+    // === 新协议适配 START: 关节模组使用协议简易说明书 V1.0 ===
+    static constexpr int16_t RAW_MIN = -32668;             // CSP位置范围下限（对应-180度）
+    static constexpr int16_t RAW_MAX = 32668;              // CSP位置范围上限（对应180度）
+    static constexpr uint8_t CTRL_ENABLE = 0x80;           // Bit[7] 上使能
+    static constexpr uint8_t CTRL_BRAKE_RELEASE = 0x40;    // Bit[6] 抱闸释放
+    static constexpr uint8_t CTRL_CLEAR_ERROR = 0x20;      // Bit[5] 复位错误
+    static constexpr uint8_t CTRL_MODE_CSP = 0x03 << 1;    // Bit[4:1] CSP循环同步位置模式
+    static constexpr uint8_t CTRL_WORD_CSP = CTRL_ENABLE | CTRL_BRAKE_RELEASE | CTRL_MODE_CSP;
+    static constexpr uint8_t CTRL_WORD_CSP_CLEAR = CTRL_WORD_CSP | CTRL_CLEAR_ERROR;
+    // === 新协议适配 END ===
     static constexpr uint8_t MAX_MOTOR_COUNT = 8;          // 多控帧最多支持8个电机
 
     // 配置参数
@@ -96,6 +104,7 @@ private:
     bool enableMotors();                // 使能电机
     void controlLoop();                 // 控制线程循环
     bool readMotorStates(bool strict_check); // 读取所有电机状态
+    void parseAndReportErrorCode(uint8_t motor_id, uint16_t error_code_raw, const std::string& source);
     void parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_frame& frame);
     bool sendMultiMotorCommand();       // 发送多控帧
     bool sendSyncFrame();               // 发送同步帧
