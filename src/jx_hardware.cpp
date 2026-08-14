@@ -539,7 +539,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 int16_t raw_current = (frame.data[4] << 8) | frame.data[5];
                 joint_efforts_[i] = static_cast<double>(raw_current); // 新协议反馈Iq电流，单位mA
 
-                uint16_t error_code = (frame.data[6] << 8) | frame.data[7];
+                uint16_t error_code = frame.data[6] | (static_cast<uint16_t>(frame.data[7]) << 8);
                 uint8_t mode_feedback = frame.data[10];
                 uint8_t status_byte = frame.data[11];
                 bool enable = (status_byte & 0x80) != 0;
@@ -624,17 +624,17 @@ void JxHardware::parseAndReportErrorCode(uint8_t motor_id, uint16_t error_code_r
     std::vector<ErrorBitMap> error_map = {
         {0x0001, 0x0001, "过压"},
         {0x0002, 0x0002, "欠压"},
-        {0x0004, 0x0003, "过温报错"},
+        {0x0004, 0x0003, "过温"},
         {0x0008, 0x0004, "堵转"},
         {0x0010, 0x0005, "过载"},
-        {0x0020, 0x0006, "电流采样错误"},
+        {0x0020, 0x0006, "速度跟踪误差过大"},
         {0x0040, 0x0007, "正限位保护"},
         {0x0080, 0x0008, "负限位保护"},
-        {0x0100, 0x0009, "编码器通信超时"},
-        {0x0200, 0x000A, "电机超过最大速度"},
-        {0x0400, 0x000B, "上电电角度初始化失败"},
-        {0x1000, 0x000C, "位置误差过大"},
-        {0x2000, 0x000D, "编码器故障"}
+        {0x0100, 0x0009, "输出端编码器异常"},
+        {0x0200, 0x000A, "位置跃迁过大"},
+        {0x0400, 0x000B, "电流采样错误"},
+        {0x0800, 0x000C, "电流跟踪误差超差"},
+        {0x1000, 0x000D, "位置跟踪误差过大"},
     };
 
     // 遍历映射表，检测每个错误位
@@ -772,7 +772,7 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
         return;
     }
 
-    uint16_t error_code_raw = (frame.data[0] << 8) | frame.data[1];
+    uint16_t error_code_raw = frame.data[0] | (static_cast<uint16_t>(frame.data[1]) << 8);
     parseAndReportErrorCode(motor_id, error_code_raw, "emergency frame");
 }
 
