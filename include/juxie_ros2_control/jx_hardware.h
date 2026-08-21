@@ -67,6 +67,11 @@ private:
     std::string can_interface_;        // CAN接口名（默认can0）
     std::vector<uint8_t> motor_ids_;   // 电机ID列表（最多8个）
     float control_period_ms_;            // 控制周期（默认1ms）
+    // CSP 单帧最大位置增量（nct）。文档写 1ms 下 >100 报错；实测 2ms 下约 100+ 也会报，
+    // 按每帧绝对值限幅，默认 90。
+    int32_t max_position_step_nct_ = 25;
+    // 相邻两帧指令速度(delta)的最大变化量（nct/cycle²）；0 表示关闭加速度限幅。
+    int32_t max_position_accel_nct_ = 5;
 
     // 状态和命令存储
     std::vector<double> joint_positions_;     // 实际位置（弧度）
@@ -74,14 +79,12 @@ private:
     std::vector<double> joint_efforts_;       // 实际力矩
     std::vector<double> joint_position_commands_; // 位置命令（弧度）
     std::vector<int16_t> raw_position_commands_;  // 位置命令（电机int16计数）
-    
-    // 插值相关变量
-    std::vector<int16_t> prev_raw_position_commands_;  // 上一帧命令（插值起点）
-    std::vector<int16_t> next_raw_position_commands_;  // 目标命令（来自ROS2控制器）
-    std::vector<int16_t> last_sent_raw_commands_;      // 上一次实际发送的命令
-    double interpolation_alpha_;                        // 插值系数（0-1）
-    double alpha_increment_;                           // 每次控制循环的alpha增量
-    
+
+    // 限速/限加速追赶：始终朝最新目标追
+    std::vector<int16_t> target_raw_position_commands_; // 最新目标（来自 ROS2 控制器）
+    std::vector<int16_t> last_sent_raw_commands_;       // 上一次实际发送的命令
+    std::vector<int32_t> last_sent_deltas_;             // 上一次实际发送的位置增量（速度）
+
     // 控制标志
     bool is_first_command_ = true;    // 标记是否是第一次发送命令
     std::atomic<bool> running_;       // 线程运行标志

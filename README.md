@@ -34,6 +34,8 @@ source install/setup.bash
 - `can_interface` (string, 默认: `"can0"`): CAN 接口名称
 - `motor_ids` (string, 必需): 电机 ID 列表，格式为 `"1,2,3"` 或 `"[1,2,3]"`
 - `control_period_ms` (int, 默认: `1`): 控制周期（毫秒），默认 1ms = 1000Hz
+- `max_position_step_nct` (int, 默认: `25`): 每个发送周期允许的最大位置增量（nct）。
+- `max_position_accel_nct` (int, 默认: `5`): 相邻两帧指令速度(delta)的最大变化量（nct/cycle²），用于加减速兜底；
 
 ## 使用示例
 
@@ -55,6 +57,9 @@ source install/setup.bash
       <param name="motor_ids">1,2,3</param>
       <!-- 控制周期（毫秒） -->
       <param name="control_period_ms">1</param>
+      <!-- 单帧最大位置增量（nct），防位置跃迁 -->
+      <param name="max_position_step_nct">25</param>
+      <param name="max_position_accel_nct">5</param>
     </hardware>
 
     <!-- 关节接口定义 -->

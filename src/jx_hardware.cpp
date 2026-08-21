@@ -51,6 +51,25 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     can_interface_ = get_param("can_interface", "can0");
     control_period_ms_ = std::stof(get_param("control_period_ms", "1")); // 默认1ms=1000Hz
 
+    max_position_step_nct_ = static_cast<int32_t>(
+        std::stoi(get_param("max_position_step_nct", "90")));
+    if (max_position_step_nct_ <= 0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'max_position_step_nct' must be > 0, got %d",
+                     max_position_step_nct_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    // 加速度限幅：限制相邻两帧 delta 的变化量；0 关闭
+    max_position_accel_nct_ = static_cast<int32_t>(
+        std::stoi(get_param("max_position_accel_nct", "10")));
+    if (max_position_accel_nct_ < 0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'max_position_accel_nct' must be >= 0, got %d",
+                     max_position_accel_nct_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
     // 解析电机ID列表
     std::string motor_ids_str = get_param("motor_ids", "");
     if (motor_ids_str.empty()) {
@@ -72,14 +91,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
-    
-    // 插值相关变量
-    prev_raw_position_commands_.resize(motor_count, 0);
-    next_raw_position_commands_.resize(motor_count, 0);
+    target_raw_position_commands_.resize(motor_count, 0);
     last_sent_raw_commands_.resize(motor_count, 0);
-    interpolation_alpha_ = 0.0;
-    alpha_increment_ = 0.0;
-    
+    last_sent_deltas_.resize(motor_count, 0);
+
     running_ = false;
     is_first_command_ = true;
 
@@ -87,6 +102,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware initialized:");
     RCLCPP_INFO(get_node()->get_logger(), "  CAN Interface: %s", can_interface_.c_str());
     RCLCPP_INFO(get_node()->get_logger(), "  Control Period: %.2f ms", control_period_ms_);
+    RCLCPP_INFO(get_node()->get_logger(), "  Max position step: %d nct/cycle", max_position_step_nct_);
+    RCLCPP_INFO(get_node()->get_logger(), "  Max position accel: %d nct/cycle^2%s",
+                max_position_accel_nct_,
+                max_position_accel_nct_ == 0 ? " (disabled)" : "");
     RCLCPP_INFO(get_node()->get_logger(), "  Motor IDs (count: %zu):", motor_ids_.size());
 
     for (uint8_t id : motor_ids_) {
@@ -131,20 +150,15 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         return hardware_interface::CallbackReturn::ERROR;
     }   
     
-    // 初始化命令缓冲区
+    // 初始化命令缓冲区（从当前反馈起步，避免首帧跃迁）
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         joint_position_commands_[i] = joint_positions_[i]; // 弧度
         double angle_deg = joint_positions_[i] * 180.0 / M_PI; // 弧度→角度
         raw_position_commands_[i] = angleToInt16(angle_deg); // 角度→电机计数
-        
-        // 初始化插值相关变量
-        prev_raw_position_commands_[i] = raw_position_commands_[i];
-        next_raw_position_commands_[i] = raw_position_commands_[i];
+        target_raw_position_commands_[i] = raw_position_commands_[i];
         last_sent_raw_commands_[i] = raw_position_commands_[i];
+        last_sent_deltas_[i] = 0;
     }
-    
-    interpolation_alpha_ = 0.0;
-    alpha_increment_ = 0.0;
 
     // 启动控制线程
     running_ = true;
@@ -230,32 +244,15 @@ hardware_interface::return_type JxHardware::read(
 
 
 hardware_interface::return_type JxHardware::write(
-    const rclcpp::Time & /* time */, const rclcpp::Duration &period) {
+    const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    // 更新插值相关变量
-    // 上一次实际发送的命令作为插值起点
-    prev_raw_position_commands_ = last_sent_raw_commands_;
-    
-    // 计算新的目标命令
+
+    // 只更新最新目标；实际下发由控制线程按 max_position_step_nct_ 限速追赶
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
-        next_raw_position_commands_[i] = angleToInt16(angle_deg);
+        target_raw_position_commands_[i] = angleToInt16(angle_deg);
     }
-    
-    // 更新插值系数增量
-    // 控制线程运行在1000Hz，period是ROS2控制器的更新周期
-    double hw_period = period.seconds();
-    if (hw_period > 0) {
-        // 使用浮点数除法
-        alpha_increment_ = (control_period_ms_ / 1000.0) / hw_period;
-    } else {
-        alpha_increment_ = 1.0;
-    }
-    
-    // 重置插值系数为0，开始新的插值周期
-    interpolation_alpha_ = 0.0;
-    
+
     return hardware_interface::return_type::OK;
 }
 
@@ -345,20 +342,44 @@ bool JxHardware::sendSyncFrame() {
 // === 发送多控帧（协议0x200，控制多个电机）===
 bool JxHardware::sendMultiMotorCommand() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    
-    // 更新插值系数
-    interpolation_alpha_ += alpha_increment_;
-    if (interpolation_alpha_ > 1.0) {
-        interpolation_alpha_ = 1.0;
-    }
-    
-    // 线性插值生成当前帧命令
+
+    // 限速 + 限加速追赶最新目标：
+    // 1) 速度：每周期 |delta| <= max_position_step_nct_
+    // 2) 加速度：|delta - last_delta| <= max_position_accel_nct_（为 0 则跳过）
+    // 3) 不越过当前目标（remaining 夹紧），避免指令超调
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
-        raw_position_commands_[i] = prev_raw_position_commands_[i] + 
-                                   interpolation_alpha_ * (next_raw_position_commands_[i] - prev_raw_position_commands_[i]);
+        const int32_t target = target_raw_position_commands_[i];
+        const int32_t last = last_sent_raw_commands_[i];
+        const int32_t remaining = target - last;
+
+        int32_t desired_delta = remaining;
+        if (desired_delta > max_position_step_nct_) {
+            desired_delta = max_position_step_nct_;
+        } else if (desired_delta < -max_position_step_nct_) {
+            desired_delta = -max_position_step_nct_;
+        }
+
+        int32_t delta = desired_delta;
+        if (max_position_accel_nct_ > 0) {
+            const int32_t last_delta = last_sent_deltas_[i];
+            const int32_t min_delta = last_delta - max_position_accel_nct_;
+            const int32_t max_delta = last_delta + max_position_accel_nct_;
+            delta = std::clamp(desired_delta, min_delta, max_delta);
+            delta = std::clamp(delta, -max_position_step_nct_, max_position_step_nct_);
+        }
+
+        // 本帧不要越过目标；若因此导致 delta 突变，以不超调优先
+        if ((remaining >= 0 && delta > remaining) || (remaining <= 0 && delta < remaining)) {
+            delta = remaining;
+        }
+
+        const int32_t sent = std::clamp(last + delta, static_cast<int32_t>(RAW_MIN),
+                                        static_cast<int32_t>(RAW_MAX));
+        raw_position_commands_[i] = static_cast<int16_t>(sent);
+        last_sent_deltas_[i] = sent - last;
         last_sent_raw_commands_[i] = raw_position_commands_[i];
     }
-    
+
     uint8_t data[CANFD_MAX_LEN] = {0};
     // 根据锁定的反馈帧长度选择控制字协议：
     // 7字节协议：首帧0xD8，后续0xD0；12字节协议：CSP控制字（首帧带清错位）
