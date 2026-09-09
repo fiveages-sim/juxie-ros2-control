@@ -22,6 +22,7 @@
 namespace juxie_ros2_control {
 class JxHardware : public hardware_interface::SystemInterface {
 public:
+    ~JxHardware() override;
     hardware_interface::CallbackReturn on_init(
         const hardware_interface::HardwareComponentInterfaceParams &params) override;
     
@@ -29,6 +30,10 @@ public:
         const rclcpp_lifecycle::State &previous_state) override;
     
     hardware_interface::CallbackReturn on_deactivate(
+        const rclcpp_lifecycle::State &previous_state) override;
+    hardware_interface::CallbackReturn on_error(
+        const rclcpp_lifecycle::State &previous_state) override;
+    hardware_interface::CallbackReturn on_shutdown(
         const rclcpp_lifecycle::State &previous_state) override;
     
     std::vector<hardware_interface::StateInterface::ConstSharedPtr> 
@@ -44,6 +49,12 @@ public:
         const rclcpp::Time &time, const rclcpp::Duration &period) override;
 
 private:
+    enum class ControlMode
+    {
+        CSP_POSITION,
+        CSV_VELOCITY,
+    };
+
     // 协议核心常量
     static constexpr uint32_t SYNC_FRAME_ID = 0x80;        // 同步帧ID
     static constexpr uint32_t MULTI_CTRL_ID = 0x200;       // 多电机控制帧ID
@@ -58,15 +69,25 @@ private:
     static constexpr uint8_t CTRL_BRAKE_RELEASE = 0x40;    // Bit[6] 抱闸释放
     static constexpr uint8_t CTRL_CLEAR_ERROR = 0x20;      // Bit[5] 复位错误
     static constexpr uint8_t CTRL_MODE_CSP = 0x03 << 1;    // Bit[4:1] CSP循环同步位置模式
+    static constexpr uint8_t CTRL_MODE_CSV = 0x04 << 1;    // Bit[4:1] CSV循环同步速度模式
     static constexpr uint8_t CTRL_WORD_CSP = CTRL_ENABLE | CTRL_BRAKE_RELEASE | CTRL_MODE_CSP;
     static constexpr uint8_t CTRL_WORD_CSP_CLEAR = CTRL_WORD_CSP | CTRL_CLEAR_ERROR;
+    static constexpr uint8_t CTRL_WORD_CSV = CTRL_ENABLE | CTRL_BRAKE_RELEASE | CTRL_MODE_CSV;
+    static constexpr uint8_t CTRL_WORD_CSV_CLEAR = CTRL_WORD_CSV | CTRL_CLEAR_ERROR;
+    static_assert(CTRL_WORD_CSV == 0xC8, "CSV control word must match the Juxie protocol");
+    static_assert(CTRL_WORD_CSV_CLEAR == 0xE8,
+                  "CSV clear-error control word must match the Juxie protocol");
     // === 新协议适配 END ===
     static constexpr uint8_t MAX_MOTOR_COUNT = 8;          // 多控帧最多支持8个电机
 
     // 配置参数
     std::string can_interface_;        // CAN接口名（默认can0）
     std::vector<uint8_t> motor_ids_;   // 电机ID列表（最多8个）
+    std::vector<ControlMode> motor_control_modes_;
+    std::vector<double> gear_ratios_;  // 电机端转速 / 输出端转速
+    bool check_firmware_version_{true};
     float control_period_ms_;            // 控制周期（默认1ms）
+    int32_t max_velocity_rpm_ = 32767;
     // CSP 单帧最大位置增量（nct）。文档写 1ms 下 >100 报错；实测 2ms 下约 100+ 也会报，
     // 按每帧绝对值限幅，默认 90。
     int32_t max_position_step_nct_ = 25;
@@ -78,7 +99,9 @@ private:
     std::vector<double> joint_velocities_;    // 实际速度（弧度/秒）
     std::vector<double> joint_efforts_;       // 实际力矩
     std::vector<double> joint_position_commands_; // 位置命令（弧度）
+    std::vector<double> joint_velocity_commands_; // 速度命令（弧度/秒）
     std::vector<int16_t> raw_position_commands_;  // 位置命令（电机int16计数）
+    std::vector<int16_t> raw_velocity_commands_;  // CSV电机端速度（RPM）
 
     // 限速/限加速追赶：始终朝最新目标追
     std::vector<int16_t> target_raw_position_commands_; // 最新目标（来自 ROS2 控制器）
@@ -87,10 +110,10 @@ private:
 
     // 控制标志
     bool is_first_command_ = true;    // 标记是否是第一次发送命令
-    std::atomic<bool> running_;       // 线程运行标志
+    std::atomic<bool> running_{false}; // 线程运行标志
 
     // CAN FD通信相关
-    int can_socket_;                    // CAN套接字
+    int can_socket_ = -1;               // CAN套接字
     struct ifreq ifr_;                  // 接口请求结构体
     struct sockaddr_can addr_;          // CAN地址结构体
     std::mutex state_mutex_;            // 状态数据互斥锁
@@ -105,6 +128,10 @@ private:
     // 辅助函数
     int16_t angleToInt16(double angle); // 角度（°）→ 电机int16计数
     double int16ToAngle(int16_t int_val); // 电机int16计数 → 角度（°）
+    bool hasVelocityControl() const;
+    const char* controlModeName() const;
+    bool readFirmwareVersion(uint8_t motor_id, std::string& version);
+    bool checkFirmwareVersions();
     bool initCanFd();                   // 初始化CAN FD接口（启用FD模式）
     bool enableMotors();                // 使能电机
     void controlLoop();                 // 控制线程循环

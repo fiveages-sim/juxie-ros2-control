@@ -6,10 +6,221 @@
 #include <chrono>
 #include <cstring>
 #include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <regex>
 #include <fcntl.h>
 #include <poll.h>
 
 namespace juxie_ros2_control {
+
+JxHardware::~JxHardware() {
+    if (can_socket_ >= 0) on_deactivate(rclcpp_lifecycle::State{});
+}
+
+hardware_interface::CallbackReturn JxHardware::on_error(const rclcpp_lifecycle::State& state) {
+    return on_deactivate(state);
+}
+
+hardware_interface::CallbackReturn JxHardware::on_shutdown(const rclcpp_lifecycle::State& state) {
+    return on_deactivate(state);
+}
+
+bool JxHardware::hasVelocityControl() const {
+    return std::find(motor_control_modes_.begin(), motor_control_modes_.end(),
+                     ControlMode::CSV_VELOCITY) != motor_control_modes_.end();
+}
+
+const char* JxHardware::controlModeName() const {
+    const bool has_csv = hasVelocityControl();
+    const bool has_csp = std::find(motor_control_modes_.begin(), motor_control_modes_.end(),
+                                   ControlMode::CSP_POSITION) != motor_control_modes_.end();
+    if (has_csv && has_csp) {
+        return "mixed CSP/CSV";
+    }
+    return has_csv ? "CSV velocity" : "CSP position";
+}
+
+bool JxHardware::readFirmwareVersion(uint8_t motor_id, std::string& version) {
+    constexpr auto response_timeout = std::chrono::milliseconds(200);
+    constexpr size_t max_version_length = 64;
+    const canid_t request_id = static_cast<canid_t>(0x600 + motor_id);
+    const canid_t response_id = static_cast<canid_t>(0x580 + motor_id);
+    version.clear();
+
+    const auto send_request = [&](uint8_t command, bool initiate) {
+        can_frame request{};
+        request.can_id = request_id;
+        request.can_dlc = 8;
+        request.data[0] = command;
+        if (initiate) {
+            request.data[1] = 0x0A;  // 0x100A:00 firmware version
+            request.data[2] = 0x10;
+            request.data[3] = 0x00;
+        }
+        if (::write(can_socket_, &request, sizeof(request)) != sizeof(request)) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Failed to send firmware SDO request to motor %u: %s",
+                         motor_id, strerror(errno));
+            return false;
+        }
+        return true;
+    };
+
+    const auto wait_response = [&](canfd_frame& response) {
+        const auto deadline = std::chrono::steady_clock::now() + response_timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const ssize_t bytes = ::read(can_socket_, &response, sizeof(response));
+            if (bytes > 0) {
+                if ((response.can_id & CAN_SFF_MASK) != response_id || response.len < 8) {
+                    continue;
+                }
+                if (response.data[0] == 0x80) {
+                    const uint32_t abort_code = static_cast<uint32_t>(response.data[4]) |
+                                                (static_cast<uint32_t>(response.data[5]) << 8) |
+                                                (static_cast<uint32_t>(response.data[6]) << 16) |
+                                                (static_cast<uint32_t>(response.data[7]) << 24);
+                    RCLCPP_ERROR(get_node()->get_logger(),
+                                 "Motor %u aborted firmware SDO read: 0x%08X",
+                                 motor_id, abort_code);
+                    return false;
+                }
+                return true;
+            }
+            if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                RCLCPP_ERROR(get_node()->get_logger(),
+                             "Firmware SDO read failed for motor %u: %s",
+                             motor_id, strerror(errno));
+                return false;
+            }
+            pollfd pfd{};
+            pfd.fd = can_socket_;
+            pfd.events = POLLIN;
+            (void)::poll(&pfd, 1, 2);
+        }
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Timed out reading firmware version from motor %u", motor_id);
+        return false;
+    };
+
+    if (!send_request(0x40, true)) {
+        return false;
+    }
+    canfd_frame response{};
+    if (!wait_response(response)) {
+        return false;
+    }
+
+    const uint8_t command = response.data[0];
+    if ((command & 0xE0) != 0x40 || response.data[1] != 0x0A ||
+        response.data[2] != 0x10 || response.data[3] != 0x00) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Invalid firmware SDO initiate response from motor %u", motor_id);
+        return false;
+    }
+
+    if ((command & 0x02) != 0) {
+        const size_t count = (command & 0x01) != 0 ? 4U - ((command >> 2) & 0x03) : 4U;
+        version.assign(reinterpret_cast<const char*>(&response.data[4]), count);
+    } else {
+        const bool size_known = (command & 0x01) != 0;
+        size_t expected_size = max_version_length;
+        if ((command & 0x01) != 0) {
+            expected_size = static_cast<size_t>(response.data[4]) |
+                            (static_cast<size_t>(response.data[5]) << 8) |
+                            (static_cast<size_t>(response.data[6]) << 16) |
+                            (static_cast<size_t>(response.data[7]) << 24);
+            if (expected_size == 0 || expected_size > max_version_length) {
+                RCLCPP_ERROR(get_node()->get_logger(),
+                             "Motor %u reported an invalid firmware string length: %zu",
+                             motor_id, expected_size);
+                return false;
+            }
+        }
+
+        uint8_t toggle = 0;
+        bool complete = false;
+        while (version.size() < expected_size) {
+            if (!send_request(static_cast<uint8_t>(0x60 | (toggle << 4)), false) ||
+                !wait_response(response)) {
+                return false;
+            }
+            const uint8_t segment_command = response.data[0];
+            if ((segment_command & 0xE0) != 0x00 ||
+                ((segment_command >> 4) & 0x01) != toggle) {
+                RCLCPP_ERROR(get_node()->get_logger(),
+                             "Invalid firmware SDO segment response from motor %u", motor_id);
+                return false;
+            }
+            const size_t count = 7U - ((segment_command >> 1) & 0x07);
+            if (!(segment_command & 0x01) && count != 7U) return false;
+            version.append(reinterpret_cast<const char*>(&response.data[1]), count);
+            if (version.size() > max_version_length) {
+                return false;
+            }
+            if ((segment_command & 0x01) != 0) {
+                complete = true;
+                break;
+            }
+            toggle ^= 1U;
+        }
+        if (!complete || (size_known && version.size() != expected_size)) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Incomplete firmware SDO value from motor %u", motor_id);
+            return false;
+        }
+    }
+
+    while (!version.empty() && (version.back() == '\0' || std::isspace(
+               static_cast<unsigned char>(version.back())))) {
+        version.pop_back();
+    }
+    return !version.empty();
+}
+
+bool JxHardware::checkFirmwareVersions() {
+    constexpr int required_major = 1;
+    constexpr int required_minor = 16;
+    constexpr int required_patch = 7;
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_control_modes_[i] != ControlMode::CSV_VELOCITY) {
+            continue;
+        }
+        std::string version;
+        if (!readFirmwareVersion(motor_ids_[i], version)) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Cannot verify firmware version for motor %u; activation aborted",
+                         motor_ids_[i]);
+            return false;
+        }
+        const std::regex pattern(R"(^\s*[vV]?([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})\s*$)");
+        std::smatch parts;
+        int major = -1;
+        int minor = -1;
+        int patch = -1;
+        if (!std::regex_match(version, parts, pattern)) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Motor %u returned malformed firmware version '%s'; activation aborted",
+                         motor_ids_[i], version.c_str());
+            return false;
+        }
+        major = std::stoi(parts[1].str());
+        minor = std::stoi(parts[2].str());
+        patch = std::stoi(parts[3].str());
+        const bool compatible = major > required_major ||
+            (major == required_major && minor > required_minor) ||
+            (major == required_major && minor == required_minor && patch >= required_patch);
+        if (!compatible) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Motor %u firmware '%s' is below required 1.16.07; hardware remains inactive",
+                         motor_ids_[i], version.c_str());
+            return false;
+        }
+        RCLCPP_INFO(get_node()->get_logger(), "Motor %u firmware: %s",
+                    motor_ids_[i], version.c_str());
+    }
+    return true;
+}
 
 int16_t JxHardware::angleToInt16(double angle) {
     // 将输入角度限制在[-180, 180]度范围内
@@ -41,6 +252,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         return hardware_interface::CallbackReturn::ERROR;
     }
 
+    try {
     const auto get_param = [&](const std::string& name, const std::string& default_val) {
         auto it = info_.hardware_parameters.find(name);
         return it != info_.hardware_parameters.end() ? it->second : default_val;
@@ -49,7 +261,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     RCLCPP_INFO(get_node()->get_logger(), "Error publisher created on /Base_HardwareError");
     // 解析核心参数
     can_interface_ = get_param("can_interface", "can0");
+    check_firmware_version_ = get_param("check_firmware_version", "true") != "false";
     control_period_ms_ = std::stof(get_param("control_period_ms", "1")); // 默认1ms=1000Hz
+    if (!std::isfinite(control_period_ms_) || control_period_ms_ < 0.1f || control_period_ms_ > 1000.f)
+        throw std::invalid_argument("control_period_ms must be finite and in [0.1,1000]");
 
     max_position_step_nct_ = static_cast<int32_t>(
         std::stoi(get_param("max_position_step_nct", "90")));
@@ -80,8 +295,95 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     motor_ids_str.erase(std::remove(motor_ids_str.begin(), motor_ids_str.end(), ']'), motor_ids_str.end());
     std::istringstream iss_ids(motor_ids_str);
     std::string token;
+    motor_ids_.clear();
     while (std::getline(iss_ids, token, ',')) {
-        motor_ids_.push_back(static_cast<uint8_t>(std::stoi(token)));
+        const int id = std::stoi(token);
+        if (id < 1 || id > 127 || std::find(motor_ids_.begin(), motor_ids_.end(), id) != motor_ids_.end())
+            throw std::invalid_argument("motor_ids must be unique CANopen IDs in [1,127]");
+        motor_ids_.push_back(static_cast<uint8_t>(id));
+    }
+    if (motor_ids_.empty() || motor_ids_.size() > MAX_MOTOR_COUNT ||
+        motor_ids_.size() != info_.joints.size()) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "motor_ids count (%zu) must match joints (%zu) and be in [1,%u]",
+                     motor_ids_.size(), info_.joints.size(), MAX_MOTOR_COUNT);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    const std::string default_mode = get_param("control_mode", "position");
+    const ControlMode configured_mode =
+        default_mode == "velocity" ? ControlMode::CSV_VELOCITY : ControlMode::CSP_POSITION;
+    if (default_mode != "position" && default_mode != "velocity") {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'control_mode' must be 'position' or 'velocity', got '%s'",
+                     default_mode.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    motor_control_modes_.assign(motor_ids_.size(), configured_mode);
+
+    std::string velocity_ids = get_param("velocity_motor_ids", "");
+    velocity_ids.erase(std::remove(velocity_ids.begin(), velocity_ids.end(), '['), velocity_ids.end());
+    velocity_ids.erase(std::remove(velocity_ids.begin(), velocity_ids.end(), ']'), velocity_ids.end());
+    std::istringstream iss_velocity_ids(velocity_ids);
+    while (std::getline(iss_velocity_ids, token, ',')) {
+        if (token.find_first_not_of(" \t") == std::string::npos) {
+            continue;
+        }
+        const int parsed_id = std::stoi(token);
+        if (parsed_id < 1 || parsed_id > 127)
+            throw std::invalid_argument("velocity_motor_ids must be in [1,127]");
+        const uint8_t id = static_cast<uint8_t>(parsed_id);
+        const auto it = std::find(motor_ids_.begin(), motor_ids_.end(), id);
+        if (it == motor_ids_.end()) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "velocity_motor_ids contains motor %u not present in motor_ids", id);
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        motor_control_modes_[static_cast<size_t>(std::distance(motor_ids_.begin(), it))] =
+            ControlMode::CSV_VELOCITY;
+    }
+
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_control_modes_[i] == ControlMode::CSV_VELOCITY &&
+            std::none_of(info_.joints[i].command_interfaces.begin(), info_.joints[i].command_interfaces.end(),
+                         [](const auto& interface) { return interface.name == "velocity"; }))
+            throw std::invalid_argument("CSV joint must declare a velocity command interface");
+    }
+    max_velocity_rpm_ = std::stoi(get_param("max_velocity_rpm", "32767"));
+    if (max_velocity_rpm_ <= 0 || max_velocity_rpm_ > 32767) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'max_velocity_rpm' must be in [1,32767], got %d",
+                     max_velocity_rpm_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    gear_ratios_.assign(motor_ids_.size(), 1.0);
+    std::string ratios = get_param("gear_ratios", "");
+    ratios.erase(std::remove(ratios.begin(), ratios.end(), '['), ratios.end());
+    ratios.erase(std::remove(ratios.begin(), ratios.end(), ']'), ratios.end());
+    if (!ratios.empty()) {
+        std::vector<double> parsed;
+        std::istringstream iss_ratios(ratios);
+        while (std::getline(iss_ratios, token, ',')) {
+            if (token.find_first_not_of(" \t") != std::string::npos) {
+                parsed.push_back(std::stod(token));
+            }
+        }
+        if (parsed.size() == 1) {
+            std::fill(gear_ratios_.begin(), gear_ratios_.end(), parsed.front());
+        } else if (parsed.size() == motor_ids_.size()) {
+            gear_ratios_ = std::move(parsed);
+        } else {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "gear_ratios needs one value or %zu values, got %zu",
+                         motor_ids_.size(), parsed.size());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+    }
+    if (std::any_of(gear_ratios_.begin(), gear_ratios_.end(),
+                    [](double ratio) { return !std::isfinite(ratio) || ratio <= 0.0; })) {
+        RCLCPP_ERROR(get_node()->get_logger(), "All gear_ratios must be finite and > 0");
+        return hardware_interface::CallbackReturn::ERROR;
     }
 
     // 初始化数据存储
@@ -90,7 +392,9 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_velocities_.resize(motor_count, 0.0);
     joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
+    joint_velocity_commands_.resize(motor_count, 0.0);
     raw_position_commands_.resize(motor_count, 0);
+    raw_velocity_commands_.resize(motor_count, 0);
     target_raw_position_commands_.resize(motor_count, 0);
     last_sent_raw_commands_.resize(motor_count, 0);
     last_sent_deltas_.resize(motor_count, 0);
@@ -102,6 +406,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware initialized:");
     RCLCPP_INFO(get_node()->get_logger(), "  CAN Interface: %s", can_interface_.c_str());
     RCLCPP_INFO(get_node()->get_logger(), "  Control Period: %.2f ms", control_period_ms_);
+    RCLCPP_INFO(get_node()->get_logger(), "  Control Mode: %s", controlModeName());
+    if (hasVelocityControl()) {
+        RCLCPP_INFO(get_node()->get_logger(), "  Max velocity: %d motor RPM", max_velocity_rpm_);
+    }
     RCLCPP_INFO(get_node()->get_logger(), "  Max position step: %d nct/cycle", max_position_step_nct_);
     RCLCPP_INFO(get_node()->get_logger(), "  Max position accel: %d nct/cycle^2%s",
                 max_position_accel_nct_,
@@ -110,6 +418,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
 
     for (uint8_t id : motor_ids_) {
         RCLCPP_INFO(get_node()->get_logger(), "    - %d", id);
+    }
+    if (hasVelocityControl() && ratios.empty()) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "CSV is using the default 1:1 gear ratio; set 'gear_ratios' for accurate rad/s");
     }
     
     ///  配置can fd 
@@ -128,6 +440,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 延时100ms，确保内核完成设备配置
 
     return hardware_interface::CallbackReturn::SUCCESS;
+    } catch (const std::exception& error) {
+        RCLCPP_ERROR(get_node()->get_logger(), "Invalid Juxie configuration: %s", error.what());
+        return hardware_interface::CallbackReturn::ERROR;
+    }
 }
 
 // === 激活硬件（初始化CAN+使能电机+获取初始状态）===
@@ -135,10 +451,19 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
     const rclcpp_lifecycle::State & /* previous_state */) {
     RCLCPP_INFO(get_node()->get_logger(), "Activating JxHardware...");
     locked_feedback_len_ = 0;
+    is_first_command_ = true;
 
     // 初始化CAN FD接口（启用1M/5M速率）
     if (!initCanFd()) {
         RCLCPP_ERROR(get_node()->get_logger(), "CAN FD initialization failed");
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    if (hasVelocityControl() && check_firmware_version_ && !checkFirmwareVersions()) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Firmware compatibility check failed; deactivating JxHardware");
+        ::close(can_socket_);
+        can_socket_ = -1;
         return hardware_interface::CallbackReturn::ERROR;
     }
 
@@ -147,8 +472,18 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
     if (!readMotorStates(true)) { 
         RCLCPP_ERROR(get_node()->get_logger(), "Incomplete motor state initialization");
         ::close(can_socket_);
+        can_socket_ = -1;
         return hardware_interface::CallbackReturn::ERROR;
-    }   
+    }
+
+    if (hasVelocityControl() && locked_feedback_len_ != 12) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "CSV velocity mode requires 12-byte feedback; detected %u bytes",
+                     locked_feedback_len_);
+        ::close(can_socket_);
+        can_socket_ = -1;
+        return hardware_interface::CallbackReturn::ERROR;
+    }
     
     // 初始化命令缓冲区（从当前反馈起步，避免首帧跃迁）
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
@@ -158,6 +493,8 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         target_raw_position_commands_[i] = raw_position_commands_[i];
         last_sent_raw_commands_[i] = raw_position_commands_[i];
         last_sent_deltas_[i] = 0;
+        joint_velocity_commands_[i] = 0.0;
+        raw_velocity_commands_[i] = 0;
     }
 
     // 启动控制线程
@@ -173,16 +510,24 @@ hardware_interface::CallbackReturn JxHardware::on_deactivate(
     const rclcpp_lifecycle::State & /* previous_state */) {
     RCLCPP_INFO(get_node()->get_logger(), "Deactivating JxHardware...");
 
-    // 停止控制线程
-    if (running_) {
-        running_ = false;
-        if (control_thread_.joinable()) {
-            control_thread_.join();
-        }
+    running_ = false;
+    if (control_thread_.joinable()) {
+        control_thread_.join();
     }
 
-    // 关闭CAN FD接口
-    ::close(can_socket_);
+    if (can_socket_ >= 0) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            std::fill(joint_velocity_commands_.begin(), joint_velocity_commands_.end(), 0.0);
+            std::fill(raw_velocity_commands_.begin(), raw_velocity_commands_.end(), 0);
+        }
+        if (hasVelocityControl()) {
+            (void)sendMultiMotorCommand();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ::close(can_socket_);
+        can_socket_ = -1;
+    }
 
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware deactivated");
     return hardware_interface::CallbackReturn::SUCCESS;
@@ -216,12 +561,18 @@ JxHardware::on_export_command_interfaces() {
     std::vector<hardware_interface::CommandInterface::SharedPtr> command_interfaces;
     for (size_t i = 0; i < info_.joints.size(); ++i) {
         const std::string& joint_name = info_.joints[i].name;
-        // 位置命令接口（弧度）
+        // 保留 position 接口以维持整机控制器的关节索引；CSV 电机额外导出 velocity。
         command_interfaces.push_back(
             std::make_shared<hardware_interface::CommandInterface>(
                 joint_name, hardware_interface::HW_IF_POSITION, &joint_position_commands_[i]));
+        if (motor_control_modes_[i] == ControlMode::CSV_VELOCITY) {
+            command_interfaces.push_back(
+                std::make_shared<hardware_interface::CommandInterface>(
+                    joint_name, hardware_interface::HW_IF_VELOCITY, &joint_velocity_commands_[i]));
+        }
     }
-    RCLCPP_INFO(get_node()->get_logger(), "Exported %zu command interfaces (position)", command_interfaces.size());
+    RCLCPP_INFO(get_node()->get_logger(), "Exported %zu command interfaces (%s)",
+                command_interfaces.size(), controlModeName());
     return command_interfaces;
 }
 
@@ -247,10 +598,29 @@ hardware_interface::return_type JxHardware::write(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // 只更新最新目标；实际下发由控制线程按 max_position_step_nct_ 限速追赶
+    // Validate before conversion to integer protocol units.
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        const double command = motor_control_modes_[i] == ControlMode::CSV_VELOCITY
+            ? joint_velocity_commands_[i] : joint_position_commands_[i];
+        if (!std::isfinite(command)) {
+            std::fill(raw_velocity_commands_.begin(), raw_velocity_commands_.end(), 0);
+            RCLCPP_ERROR(get_node()->get_logger(), "Non-finite command for motor %u", motor_ids_[i]);
+            return hardware_interface::return_type::ERROR;
+        }
+    }
+    // 更新最新目标；实际下发由独立控制线程完成。
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
-        double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
-        target_raw_position_commands_[i] = angleToInt16(angle_deg);
+        if (motor_control_modes_[i] == ControlMode::CSP_POSITION) {
+            const double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
+            target_raw_position_commands_[i] = angleToInt16(angle_deg);
+        } else {
+            const double motor_rpm = joint_velocity_commands_[i] * 60.0 /
+                                     (2.0 * M_PI) * gear_ratios_[i];
+            const long rounded = std::lround(std::clamp(
+                motor_rpm, -static_cast<double>(max_velocity_rpm_),
+                static_cast<double>(max_velocity_rpm_)));
+            raw_velocity_commands_[i] = static_cast<int16_t>(rounded);
+        }
     }
 
     return hardware_interface::return_type::OK;
@@ -268,6 +638,7 @@ bool JxHardware::initCanFd() {
     if (ioctl(can_socket_, SIOCGIFINDEX, &ifr_) < 0) {
         RCLCPP_ERROR(get_node()->get_logger(), "CAN interface index failed: %s", strerror(errno));
         ::close(can_socket_);
+        can_socket_ = -1;
         return false;
     }
 
@@ -276,6 +647,7 @@ bool JxHardware::initCanFd() {
     if (::bind(can_socket_, (struct sockaddr *)&addr_, sizeof(addr_)) < 0) {
         RCLCPP_ERROR(get_node()->get_logger(), "CAN bind failed: %s", strerror(errno));
         ::close(can_socket_);
+        can_socket_ = -1;
         return false;
     }
 
@@ -284,6 +656,7 @@ bool JxHardware::initCanFd() {
     if (::setsockopt(can_socket_, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &enable_fd, sizeof(enable_fd)) < 0) {
         RCLCPP_ERROR(get_node()->get_logger(), "CAN FD enable failed: %s", strerror(errno));
         ::close(can_socket_);
+        can_socket_ = -1;
         return false;
     }
 
@@ -292,6 +665,7 @@ bool JxHardware::initCanFd() {
     if (flags < 0 || ::fcntl(can_socket_, F_SETFL, flags | O_NONBLOCK) < 0) {
         RCLCPP_ERROR(get_node()->get_logger(), "CAN set non-blocking failed: %s", strerror(errno));
         ::close(can_socket_);
+        can_socket_ = -1;
         return false;
     }
 
@@ -348,6 +722,9 @@ bool JxHardware::sendMultiMotorCommand() {
     // 2) 加速度：|delta - last_delta| <= max_position_accel_nct_（为 0 则跳过）
     // 3) 不越过当前目标（remaining 夹紧），避免指令超调
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_control_modes_[i] != ControlMode::CSP_POSITION) {
+            continue;
+        }
         const int32_t target = target_raw_position_commands_[i];
         const int32_t last = last_sent_raw_commands_[i];
         const int32_t remaining = target - last;
@@ -381,22 +758,21 @@ bool JxHardware::sendMultiMotorCommand() {
     }
 
     uint8_t data[CANFD_MAX_LEN] = {0};
-    // 根据锁定的反馈帧长度选择控制字协议：
-    // 7字节协议：首帧0xD8，后续0xD0；12字节协议：CSP控制字（首帧带清错位）
-    uint8_t control_byte = 0;
-    if (locked_feedback_len_ == 7) {
-        control_byte = is_first_command_ ? 0xD8 : 0xD0;
-    } else {
-        control_byte = is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP;
-    }
-
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         int pkg_offset = i * 7;
-        // === 新协议适配 START: 单个控制分包与新版单轴控制报文保持一致 ===
-        data[pkg_offset + 0] = control_byte; // 控制位：ENABLE=1、BRAKE=1、MODE=CSP位置模式
-        data[pkg_offset + 1] = (raw_position_commands_[i] >> 8) & 0xFF; // 位置高字节
-        data[pkg_offset + 2] = raw_position_commands_[i] & 0xFF;        // 位置低字节
+        const bool is_position = motor_control_modes_[i] == ControlMode::CSP_POSITION;
+        const uint8_t control_byte = locked_feedback_len_ == 7
+            ? (is_first_command_ ? 0xD8 : 0xD0)
+            : (is_position
+                ? (is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP)
+                : (is_first_command_ ? CTRL_WORD_CSV_CLEAR : CTRL_WORD_CSV));
+        const int16_t raw_command = is_position
+            ? raw_position_commands_[i] : raw_velocity_commands_[i];
+        const uint16_t encoded = static_cast<uint16_t>(raw_command);
+        data[pkg_offset + 0] = control_byte;
+        data[pkg_offset + 1] = (encoded >> 8) & 0xFF;
+        data[pkg_offset + 2] = encoded & 0xFF;
         data[pkg_offset + 3] = 0x00; // 目标参数2，CSP模式下不使用
         data[pkg_offset + 4] = 0x00;
         data[pkg_offset + 5] = 0x00; // 目标前馈参数，CSP模式下不使用
@@ -422,7 +798,7 @@ bool JxHardware::sendMultiMotorCommand() {
     
     // 第一次发送后更新标志
     if (is_first_command_) {
-        RCLCPP_INFO(get_node()->get_logger(), "Sent first CSP command with control byte 0x%02X", control_byte);
+        RCLCPP_INFO(get_node()->get_logger(), "Sent first %s command", controlModeName());
         is_first_command_ = false;
     }
 
@@ -555,7 +931,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 joint_positions_[i] = angle_deg * M_PI / 180.0;
 
                 int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
-                joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
+                joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0 / gear_ratios_[i];
 
                 int16_t raw_current = (frame.data[4] << 8) | frame.data[5];
                 joint_efforts_[i] = static_cast<double>(raw_current); // 新协议反馈Iq电流，单位mA
@@ -570,10 +946,14 @@ bool JxHardware::readMotorStates(bool strict_check) {
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                        5000, "Motor %d is not enabled", id);
                 }
-                if (mode_feedback != 0x03) {
+                const uint8_t expected_mode = motor_control_modes_[i] == ControlMode::CSV_VELOCITY
+                    ? 0x04 : 0x03;
+                if (mode_feedback != expected_mode) {
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                        5000, "Motor %d mode feedback is 0x%02X, expected CSP(0x03)",
-                                        id, mode_feedback);
+                                        5000, "Motor %d mode feedback is 0x%02X, expected 0x%02X (%s)",
+                                        id, mode_feedback, expected_mode,
+                                        motor_control_modes_[i] == ControlMode::CSV_VELOCITY
+                                            ? "CSV velocity" : "CSP position");
                 }
                 if (error) {
                     if (error_code != 0) {
@@ -597,7 +977,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 joint_positions_[i] = angle_deg * M_PI / 180.0;
 
                 int16_t raw_vel = (frame.data[2] << 8) | frame.data[3];
-                joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0;
+                joint_velocities_[i] = raw_vel * 2 * M_PI / 60.0 / gear_ratios_[i];
 
                 joint_efforts_[i] = 0.0;
                 uint8_t status_byte = frame.data[6];
