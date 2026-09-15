@@ -8,6 +8,8 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
+#include <cstdio>
+#include <sys/wait.h>
 
 namespace juxie_ros2_control {
 
@@ -112,20 +114,52 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         RCLCPP_INFO(get_node()->get_logger(), "    - %d", id);
     }
     
-    ///  配置can fd 
-    std::string can_config_cmd = 
-        "sudo ip link set " + can_interface_ + " down && "  
-        "sudo ip link set " + can_interface_ + " up type can "
-        "bitrate 1000000 "          // 仲裁段波特率1M
-        "dbitrate 5000000 "         // 数据段波特率5M
-        "fd on ";                    // 启用FD模式
-    
-    int config_ret = system(can_config_cmd.c_str());  
-    if (config_ret == -1 || WEXITSTATUS(config_ret) != 0) {
-        RCLCPP_ERROR(get_node()->get_logger(), " [CAN FD] Failed to configure %s!", can_interface_.c_str());
-        return hardware_interface::CallbackReturn::ERROR;
+    /// 配置 CAN FD：若已是目标参数则跳过 down/up，避免打断已在用的接口
+    constexpr const char* kCanBitrate = "1000000";
+    constexpr const char* kCanDbitrate = "5000000";
+    auto is_can_already_configured = [&]() -> bool {
+        std::string check_cmd = "ip -details link show " + can_interface_ + " 2>/dev/null";
+        FILE* pipe = popen(check_cmd.c_str(), "r");
+        if (!pipe) {
+            return false;
+        }
+        std::string output;
+        char buf[256];
+        while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+            output += buf;
+        }
+        pclose(pipe);
+
+        // " bitrate" 前加空格，避免被 "dbitrate" 误匹配
+        const bool is_up = output.find("state UP") != std::string::npos;
+        const bool has_bitrate =
+            output.find(std::string(" bitrate ") + kCanBitrate) != std::string::npos;
+        const bool has_dbitrate =
+            output.find(std::string("dbitrate ") + kCanDbitrate) != std::string::npos;
+        const bool has_fd = output.find("<FD>") != std::string::npos;
+        return is_up && has_bitrate && has_dbitrate && has_fd;
+    };
+
+    if (is_can_already_configured()) {
+        RCLCPP_INFO(get_node()->get_logger(),
+                    " [CAN FD] %s already configured (1M/5M, FD, UP), skip reconfigure",
+                    can_interface_.c_str());
+    } else {
+        std::string can_config_cmd =
+            "sudo ip link set " + can_interface_ + " down && "
+            "sudo ip link set " + can_interface_ + " up type can "
+            "bitrate " + kCanBitrate + " "      // 仲裁段波特率1M
+            "dbitrate " + kCanDbitrate + " "     // 数据段波特率5M
+            "fd on ";                            // 启用FD模式
+
+        int config_ret = system(can_config_cmd.c_str());
+        if (config_ret == -1 || WEXITSTATUS(config_ret) != 0) {
+            RCLCPP_ERROR(get_node()->get_logger(), " [CAN FD] Failed to configure %s!",
+                         can_interface_.c_str());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 确保内核完成设备配置
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 延时100ms，确保内核完成设备配置
 
     return hardware_interface::CallbackReturn::SUCCESS;
 }
