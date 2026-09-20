@@ -11,7 +11,7 @@
 
 namespace juxie_ros2_control {
 
-int16_t JxHardware::angleToInt16(double angle) {
+int16_t JxHardware::angleToInt16(double angle) const {
     // 将输入角度限制在[-180, 180]度范围内
     double clamped_angle = std::clamp(angle, ANGLE_MIN, ANGLE_MAX);    
     // 计算角度在范围内的比例（0~1）
@@ -70,6 +70,22 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         return hardware_interface::CallbackReturn::ERROR;
     }
 
+    // === 空闲自动下使能/抱闸参数 ===
+    auto_disable_on_idle_ =
+        (get_param("auto_disable_on_idle", "false") == "true");
+    idle_timeout_ms_ = static_cast<int32_t>(
+        std::stoi(get_param("idle_timeout_ms", "500")));
+    idle_position_tol_nct_ = static_cast<int32_t>(
+        std::stoi(get_param("idle_position_tol_nct", "2")));
+    idle_velocity_tol_ = std::stod(get_param("idle_velocity_tol", "0.02"));
+    enable_deadband_nct_ = static_cast<int32_t>(
+        std::stoi(get_param("enable_deadband_nct", "10")));
+    if (auto_disable_on_idle_ && idle_timeout_ms_ <= 0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'idle_timeout_ms' must be > 0 when auto_disable_on_idle is true, got %d",
+                     idle_timeout_ms_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
     // 解析电机ID列表
     std::string motor_ids_str = get_param("motor_ids", "");
     if (motor_ids_str.empty()) {
@@ -94,9 +110,14 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     target_raw_position_commands_.resize(motor_count, 0);
     last_sent_raw_commands_.resize(motor_count, 0);
     last_sent_deltas_.resize(motor_count, 0);
+    disabled_hold_raw_.resize(motor_count, 0);
 
     running_ = false;
     is_first_command_ = true;
+    command_pending_ = false;
+    disable_pending_ = false;
+    motors_disabled_ = false;
+    last_command_change_time_ = std::chrono::steady_clock::now();
 
     // 打印初始化信息
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware initialized:");
@@ -106,6 +127,10 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     RCLCPP_INFO(get_node()->get_logger(), "  Max position accel: %d nct/cycle^2%s",
                 max_position_accel_nct_,
                 max_position_accel_nct_ == 0 ? " (disabled)" : "");
+    RCLCPP_INFO(get_node()->get_logger(),
+                "  Auto disable on idle: %s (timeout %d ms, pos tol %d nct, vel tol %.3f rad/s, wake deadband %d nct)",
+                auto_disable_on_idle_ ? "enabled" : "disabled", idle_timeout_ms_,
+                idle_position_tol_nct_, idle_velocity_tol_, enable_deadband_nct_);
     RCLCPP_INFO(get_node()->get_logger(), "  Motor IDs (count: %zu):", motor_ids_.size());
 
     for (uint8_t id : motor_ids_) {
@@ -135,6 +160,11 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
     const rclcpp_lifecycle::State & /* previous_state */) {
     RCLCPP_INFO(get_node()->get_logger(), "Activating JxHardware...");
     locked_feedback_len_ = 0;
+    is_first_command_ = true;
+    command_pending_ = false;
+    disable_pending_ = false;
+    motors_disabled_ = false;
+    last_command_change_time_ = std::chrono::steady_clock::now();
 
     // 初始化CAN FD接口（启用1M/5M速率）
     if (!initCanFd()) {
@@ -158,6 +188,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         target_raw_position_commands_[i] = raw_position_commands_[i];
         last_sent_raw_commands_[i] = raw_position_commands_[i];
         last_sent_deltas_[i] = 0;
+        disabled_hold_raw_[i] = raw_position_commands_[i];
     }
 
     // 启动控制线程
@@ -247,13 +278,99 @@ hardware_interface::return_type JxHardware::write(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // 只更新最新目标；实际下发由控制线程按 max_position_step_nct_ 限速追赶
+    // 检测目标是否变化；实际下发由控制线程按 max_position_step_nct_ 限速追赶
+    bool command_changed = false;
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
-        target_raw_position_commands_[i] = angleToInt16(angle_deg);
+        int16_t new_raw = angleToInt16(angle_deg);
+        if (new_raw != target_raw_position_commands_[i]) {
+            command_changed = true;
+            target_raw_position_commands_[i] = new_raw;
+        }
     }
 
+    const auto now = std::chrono::steady_clock::now();
+
+    if (command_changed) {
+        // 有新命令：记录时刻，并取消尚未发出的下使能请求
+        last_command_change_time_ = now;
+        disable_pending_ = false;
+
+        if (motors_disabled_) {
+            // 只有命令变化超过死区才唤醒。位置控制器在“保持”时仍会持续发布同一个值，
+            // 而慢速运动时每个周期只变化 0~1 nct；若不设死区，两者都会被当成“新指令”，
+            // 会造成 上使能 → 下使能 → 上使能 的周期性震荡。
+            bool wake_up = false;
+            for (size_t i = 0; i < motor_ids_.size(); ++i) {
+                const int32_t diff = static_cast<int32_t>(target_raw_position_commands_[i]) -
+                                     static_cast<int32_t>(disabled_hold_raw_[i]);
+                if (std::abs(diff) > enable_deadband_nct_) {
+                    wake_up = true;
+                    break;
+                }
+            }
+            if (wake_up) {
+                // 下使能期间电机实际位置可能变化，必须先对齐反馈再发首帧
+                syncCommandsFromFeedback();
+                is_first_command_ = true;
+                motors_disabled_ = false;
+                command_pending_ = true;
+                RCLCPP_INFO(get_node()->get_logger(),
+                            "New command received while disabled, re-enabling motors "
+                            "(commands synced from feedback)");
+            }
+        } else {
+            // 上使能状态下持续下发 CSP 帧保持跟踪
+            command_pending_ = true;
+        }
+    }
+
+    if (!auto_disable_on_idle_ || motors_disabled_ || !command_pending_) {
+        return hardware_interface::return_type::OK;
+    }
+
+    // === 空闲判定：必须同时满足“超时 + 到位 + 静止” ===
+    // 1) 距最后一次命令变化超过 idle_timeout_ms_ 才认为“没有新指令”
+    const auto idle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_command_change_time_).count();
+    if (idle_ms < idle_timeout_ms_) {
+        return hardware_interface::return_type::OK;
+    }
+    // 2) 已追上目标且速度为 0，位置/速度反馈都在容差内
+    if (!isIdleAtTarget()) {
+        return hardware_interface::return_type::OK;
+    }
+
+    // 3) 请求发送一次下使能/抱闸帧，之后停止下发 CSP
+    command_pending_ = false;
+    disable_pending_ = true;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "No new command for %ld ms and joint at target, requesting disable/brake",
+                static_cast<long>(idle_ms));
     return hardware_interface::return_type::OK;
+}
+
+// === 空闲判定（调用者需持有 state_mutex_）===
+bool JxHardware::isIdleAtTarget() const {
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        // 指令已经追上目标
+        if (last_sent_raw_commands_[i] != target_raw_position_commands_[i] ||
+            last_sent_deltas_[i] != 0) {
+            return false;
+        }
+        // 反馈位置已经到位（避免还在追赶或跟踪误差很大时下使能）
+        const int16_t fb_raw = angleToInt16(joint_positions_[i] * 180.0 / M_PI);
+        if (std::abs(static_cast<int32_t>(fb_raw) -
+                     static_cast<int32_t>(target_raw_position_commands_[i])) >
+            idle_position_tol_nct_) {
+            return false;
+        }
+        // 确实静止（运动中下使能会抱闸急停，重上使能时极易触发位置跃迁故障）
+        if (std::fabs(joint_velocities_[i]) > idle_velocity_tol_) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // === CAN FD初始化（启用FD模式）===
@@ -339,56 +456,85 @@ bool JxHardware::sendSyncFrame() {
     return true;
 }
 
+// === 用反馈位置对齐命令缓存（上下使能切换时必须调用）===
+void JxHardware::syncCommandsFromFeedback() {
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        const double angle_deg = joint_positions_[i] * 180.0 / M_PI;
+        const int16_t raw = angleToInt16(angle_deg);
+        last_sent_raw_commands_[i] = raw;
+        raw_position_commands_[i] = raw;
+        last_sent_deltas_[i] = 0;
+    }
+}
+
+// === 按反馈协议选择上使能控制字 ===
+uint8_t JxHardware::getEnableControlByte() const {
+    if (locked_feedback_len_ == 7) {
+        return is_first_command_ ? CTRL_WORD_7_ENABLE_CLEAR : CTRL_WORD_7_ENABLE;
+    }
+    return is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP;
+}
+
+// === 按反馈协议选择下使能/抱闸控制字 ===
+uint8_t JxHardware::getDisableControlByte() const {
+    if (locked_feedback_len_ == 7) {
+        return CTRL_WORD_7_DISABLE;  // 0x10
+    }
+    // 12字节：Bit7 使能、Bit6 抱闸释放清零
+    return CTRL_WORD_CSP_DISABLE;
+}
+
 // === 发送多控帧（协议0x200，控制多个电机）===
 bool JxHardware::sendMultiMotorCommand() {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // 限速 + 限加速追赶最新目标：
-    // 1) 速度：每周期 |delta| <= max_position_step_nct_
-    // 2) 加速度：|delta - last_delta| <= max_position_accel_nct_（为 0 则跳过）
-    // 3) 不越过当前目标（remaining 夹紧），避免指令超调
-    for (size_t i = 0; i < motor_ids_.size(); ++i) {
-        const int32_t target = target_raw_position_commands_[i];
-        const int32_t last = last_sent_raw_commands_[i];
-        const int32_t remaining = target - last;
-
-        int32_t desired_delta = remaining;
-        if (desired_delta > max_position_step_nct_) {
-            desired_delta = max_position_step_nct_;
-        } else if (desired_delta < -max_position_step_nct_) {
-            desired_delta = -max_position_step_nct_;
+    if (is_first_command_) {
+        // 重新上使能首帧：只发当前反馈位置，不做位置增量，避免位置跃迁故障
+        for (size_t i = 0; i < motor_ids_.size(); ++i) {
+            raw_position_commands_[i] = last_sent_raw_commands_[i];
+            last_sent_deltas_[i] = 0;
         }
+    } else {
+        // 限速 + 限加速追赶最新目标：
+        // 1) 速度：每周期 |delta| <= max_position_step_nct_
+        // 2) 加速度：|delta - last_delta| <= max_position_accel_nct_（为 0 则跳过）
+        // 3) 不越过当前目标（remaining 夹紧），避免指令超调
+        for (size_t i = 0; i < motor_ids_.size(); ++i) {
+            const int32_t target = target_raw_position_commands_[i];
+            const int32_t last = last_sent_raw_commands_[i];
+            const int32_t remaining = target - last;
 
-        int32_t delta = desired_delta;
-        if (max_position_accel_nct_ > 0) {
-            const int32_t last_delta = last_sent_deltas_[i];
-            const int32_t min_delta = last_delta - max_position_accel_nct_;
-            const int32_t max_delta = last_delta + max_position_accel_nct_;
-            delta = std::clamp(desired_delta, min_delta, max_delta);
-            delta = std::clamp(delta, -max_position_step_nct_, max_position_step_nct_);
+            int32_t desired_delta = remaining;
+            if (desired_delta > max_position_step_nct_) {
+                desired_delta = max_position_step_nct_;
+            } else if (desired_delta < -max_position_step_nct_) {
+                desired_delta = -max_position_step_nct_;
+            }
+
+            int32_t delta = desired_delta;
+            if (max_position_accel_nct_ > 0) {
+                const int32_t last_delta = last_sent_deltas_[i];
+                const int32_t min_delta = last_delta - max_position_accel_nct_;
+                const int32_t max_delta = last_delta + max_position_accel_nct_;
+                delta = std::clamp(desired_delta, min_delta, max_delta);
+                delta = std::clamp(delta, -max_position_step_nct_, max_position_step_nct_);
+            }
+
+            // 本帧不要越过目标；若因此导致 delta 突变，以不超调优先
+            if ((remaining >= 0 && delta > remaining) || (remaining <= 0 && delta < remaining)) {
+                delta = remaining;
+            }
+
+            const int32_t sent = std::clamp(last + delta, static_cast<int32_t>(RAW_MIN),
+                                            static_cast<int32_t>(RAW_MAX));
+            raw_position_commands_[i] = static_cast<int16_t>(sent);
+            last_sent_deltas_[i] = sent - last;
+            last_sent_raw_commands_[i] = raw_position_commands_[i];
         }
-
-        // 本帧不要越过目标；若因此导致 delta 突变，以不超调优先
-        if ((remaining >= 0 && delta > remaining) || (remaining <= 0 && delta < remaining)) {
-            delta = remaining;
-        }
-
-        const int32_t sent = std::clamp(last + delta, static_cast<int32_t>(RAW_MIN),
-                                        static_cast<int32_t>(RAW_MAX));
-        raw_position_commands_[i] = static_cast<int16_t>(sent);
-        last_sent_deltas_[i] = sent - last;
-        last_sent_raw_commands_[i] = raw_position_commands_[i];
     }
 
     uint8_t data[CANFD_MAX_LEN] = {0};
-    // 根据锁定的反馈帧长度选择控制字协议：
-    // 7字节协议：首帧0xD8，后续0xD0；12字节协议：CSP控制字（首帧带清错位）
-    uint8_t control_byte = 0;
-    if (locked_feedback_len_ == 7) {
-        control_byte = is_first_command_ ? 0xD8 : 0xD0;
-    } else {
-        control_byte = is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP;
-    }
+    const uint8_t control_byte = getEnableControlByte();
 
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
@@ -426,6 +572,63 @@ bool JxHardware::sendMultiMotorCommand() {
         is_first_command_ = false;
     }
 
+    // 注意：这里不再判断“是否追上目标”并触发下使能。
+    // 刚重新上使能时，首帧位置是直接从反馈对齐的，会被误判为“已到位”，
+    // 导致 上使能 → 立即下使能 → 再上使能 的周期性震荡。
+    // 下使能统一由 write() 根据“空闲超时 + 到位 + 静止”决定。
+    return true;
+}
+
+// === 发送下使能/抱闸多控帧（到位后发一次，之后停发）===
+bool JxHardware::sendDisableMultiMotorCommand() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+
+    if (motors_disabled_) {
+        disable_pending_ = false;
+        return true;
+    }
+
+    // 下使能帧也使用当前反馈位置，避免与驱动器内部位置参考不一致
+    syncCommandsFromFeedback();
+
+    uint8_t data[CANFD_MAX_LEN] = {0};
+    const uint8_t control_byte = getDisableControlByte();
+
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        int pkg_offset = i * 7;
+        data[pkg_offset + 0] = control_byte;
+        data[pkg_offset + 1] = (last_sent_raw_commands_[i] >> 8) & 0xFF;
+        data[pkg_offset + 2] = last_sent_raw_commands_[i] & 0xFF;
+        data[pkg_offset + 3] = 0x00;
+        data[pkg_offset + 4] = 0x00;
+        data[pkg_offset + 5] = 0x00;
+        data[pkg_offset + 6] = 0x00;
+        last_sent_deltas_[i] = 0;
+        raw_position_commands_[i] = last_sent_raw_commands_[i];
+        // 记录下使能时刻的位置，作为重新上使能的死区基准
+        disabled_hold_raw_[i] = last_sent_raw_commands_[i];
+    }
+
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        data[56 + i] = motor_ids_[i];
+    }
+
+    struct canfd_frame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.can_id = static_cast<canid_t>(MULTI_CTRL_ID);
+    frame.len = CANFD_MAX_LEN;
+    memcpy(frame.data, data, CANFD_MAX_LEN);
+    if (::write(can_socket_, &frame, sizeof(frame)) != sizeof(frame)) {
+        RCLCPP_ERROR(get_node()->get_logger(), "Multi-motor disable command failed: %s", strerror(errno));
+        return false;
+    }
+
+    motors_disabled_ = true;
+    disable_pending_ = false;
+    command_pending_ = false;   // 下使能期间不再下发 CSP 帧
+    RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 2000,
+                         "Sent disable/brake command (control byte 0x%02X, protocol len %u)",
+                         control_byte, locked_feedback_len_);
     return true;
 }
 
@@ -804,23 +1007,29 @@ void JxHardware::controlLoop() {
     auto next_time = std::chrono::steady_clock::now() + period;
 
     while (running_) {
-        sendMultiMotorCommand();
-        
+        if (disable_pending_) {
+            // 满足空闲条件：发送一次下使能/抱闸帧后停发
+            sendDisableMultiMotorCommand();
+        } else if (command_pending_) {
+            // 上使能跟踪：每个周期下发一次 CSP 控制帧
+            sendMultiMotorCommand();
+        }
+
         // 精确睡眠到下一个时间点
         std::this_thread::sleep_until(next_time);
         next_time += period;
-        
+
         // 防止累积误差
         auto now = std::chrono::steady_clock::now();
         if (next_time < now) {
             // 如果落后了，调整到下个周期
             next_time = now + period;
+        }
     }
-}
     RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
+}
 
 } // namespace juxie_ros2_control
 
 // 导出插件
 PLUGINLIB_EXPORT_CLASS(juxie_ros2_control::JxHardware, hardware_interface::SystemInterface)
-}

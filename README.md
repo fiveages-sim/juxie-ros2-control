@@ -37,6 +37,26 @@ source install/setup.bash
 - `max_position_step_nct` (int, 默认: `25`): 每个发送周期允许的最大位置增量（nct）。
 - `max_position_accel_nct` (int, 默认: `5`): 相邻两帧指令速度(delta)的最大变化量（nct/cycle²），用于加减速兜底；
 
+### 空闲自动下使能/抱闸（可选）
+
+当控制器长时间不再更新位置指令时，自动下发一次下使能+抱闸帧，之后停止发送 CSP 帧。
+
+- `auto_disable_on_idle` (bool, 默认: `false`): 是否启用该功能
+- `idle_timeout_ms` (int, 默认: `500`): 距最后一次“目标变化”超过该时长才算空闲
+- `idle_position_tol_nct` (int, 默认: `2`): 到位判定容差（nct）
+- `idle_velocity_tol` (double, 默认: `0.02`): 静止判定容差（rad/s）
+- `enable_deadband_nct` (int, 默认: `10`): 下使能状态下重新上使能所需的最小命令变化（nct）
+
+<param name="auto_disable_on_idle">true</param>
+<param name="idle_timeout_ms">500</param>
+<param name="enable_deadband_nct">10</param>
+
+
+> ⚠️ 不要用“相邻两帧指令值是否相同”来判断“有没有新指令”：慢速运动时每个控制周期
+> 指令只变化 0~1 nct，会被误判为空闲；下使能期间控制器仍会持续发布同一个保持值，
+> 又会被误判为“有新指令”。两者叠加会造成 上使能 → 下使能 → 上使能 的周期性震荡，
+> 并触发驱动 `位置跃迁过大` 故障。因此必须使用“超时 + 到位 + 静止”判定。
+
 ## 使用示例
 
 ### 1. 在 URDF/Xacro 中配置硬件接口
@@ -60,6 +80,10 @@ source install/setup.bash
       <!-- 单帧最大位置增量（nct），防位置跃迁 -->
       <param name="max_position_step_nct">25</param>
       <param name="max_position_accel_nct">5</param>
+      <!-- 空闲自动下使能/抱闸（默认关闭） -->
+      <param name="auto_disable_on_idle">true</param>
+      <param name="idle_timeout_ms">500</param>
+      <param name="enable_deadband_nct">10</param>
     </hardware>
 
     <!-- 关节接口定义 -->
