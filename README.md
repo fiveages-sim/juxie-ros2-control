@@ -152,3 +152,16 @@ ros2 topic pub /joint_trajectory_controller/joint_trajectory \
 - **CAN 接口初始化失败**: 检查 CAN 接口名称是否正确，接口是否已连接
 - **电机无响应**: 检查电机 ID 配置是否正确，CAN 总线连接是否正常
 - **权限错误**: 确保具有配置 CAN 接口的权限，可能需要使用 sudo 或配置 udev 规则
+
+## 实验性 body_joint4 力矩接口
+
+默认关闭。`joint4_cst_enabled=true` 时增加 joint4 的 `effort`（输出端 Nm）与 `cst_enable` 命令接口，其他关节保持 CSP。只支持明确选择的 `canfd_iq_ma` 协议适配，必须提供标定换算及限值；这不是未经确认的直接 Nm 报文。详见仓库 `controller/ocs2_wbc_controller/config/joint4_impedance.md`。
+
+
+## 电流环线程与故障保持
+
+- `write()` 校验完整命令后，在互斥锁内提交位置/速度快照；发送线程不读取命令接口裸指针。
+- `feedback_timeout_sec` 默认为 `0.02` 秒，必须为正有限数。发送线程按 steady clock 检查每轴最后健康反馈；CM 不再调用 `read()` 且发送线程能够取得 `state_mutex_` 时，超时轴会锁存 CSP 请求；如果该锁被阻塞的读线程持有，本检查也会等待，不能替代硬件看门狗。原 `feedback_timeout_cycles` 检查仍保留，两者任一触发即锁存。
+- CAN 瞬时错误（EAGAIN/EWOULDBLOCK、ENOBUFS、EINTR）按正常周期重试，连续失败达 100 ms 或遇到其他错误才锁存故障，由 `read()` / `write()` 返回 ERROR；后续发送尝试仅使用 CSP 保持目标，直到生命周期停用。发送成功不等于电机已确认切换模式。
+- 锁存位置独立保存，停用及重新激活均不覆盖；仅重新初始化解除锁存。
+- `current_loop_safety_test` 使用本地 datagram socket 检查实际驱动的命令、反馈和发送故障路径，不连接真实 CAN。

@@ -31,12 +31,26 @@ bool JxHardware::hasVelocityControl() const {
                      ControlMode::CSV_VELOCITY) != motor_control_modes_.end();
 }
 
+bool JxHardware::hasCurrentControl() const {
+    return std::find(motor_control_modes_.begin(), motor_control_modes_.end(),
+                     ControlMode::CURRENT_TORQUE) != motor_control_modes_.end();
+}
+
 const char* JxHardware::controlModeName() const {
-    const bool has_csv = hasVelocityControl();
-    const bool has_csp = std::find(motor_control_modes_.begin(), motor_control_modes_.end(),
-                                   ControlMode::CSP_POSITION) != motor_control_modes_.end();
-    if (has_csv && has_csp) {
-        return "mixed CSP/CSV";
+    bool has_csv = false;
+    bool has_csp = false;
+    bool has_current = false;
+    for (const auto mode : motor_control_modes_) {
+        has_csv = has_csv || mode == ControlMode::CSV_VELOCITY;
+        has_csp = has_csp || mode == ControlMode::CSP_POSITION;
+        has_current = has_current || mode == ControlMode::CURRENT_TORQUE;
+    }
+    const int kinds = static_cast<int>(has_csv) + static_cast<int>(has_csp) + static_cast<int>(has_current);
+    if (kinds > 1) {
+        return "mixed CSP/CSV/CURRENT";
+    }
+    if (has_current) {
+        return "current loop (torque, mA)";
     }
     return has_csv ? "CSV velocity" : "CSP position";
 }
@@ -311,43 +325,88 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     }
 
     const std::string default_mode = get_param("control_mode", "position");
-    const ControlMode configured_mode =
-        default_mode == "velocity" ? ControlMode::CSV_VELOCITY : ControlMode::CSP_POSITION;
-    if (default_mode != "position" && default_mode != "velocity") {
+    ControlMode configured_mode = ControlMode::CSP_POSITION;
+    if (default_mode == "velocity") {
+        configured_mode = ControlMode::CSV_VELOCITY;
+    } else if (default_mode == "current") {
+        configured_mode = ControlMode::CURRENT_TORQUE;
+    } else if (default_mode != "position") {
         RCLCPP_ERROR(get_node()->get_logger(),
-                     "Parameter 'control_mode' must be 'position' or 'velocity', got '%s'",
+                     "Parameter 'control_mode' must be 'position', 'velocity' or 'current', got '%s'",
                      default_mode.c_str());
         return hardware_interface::CallbackReturn::ERROR;
     }
     motor_control_modes_.assign(motor_ids_.size(), configured_mode);
 
-    std::string velocity_ids = get_param("velocity_motor_ids", "");
-    velocity_ids.erase(std::remove(velocity_ids.begin(), velocity_ids.end(), '['), velocity_ids.end());
-    velocity_ids.erase(std::remove(velocity_ids.begin(), velocity_ids.end(), ']'), velocity_ids.end());
-    std::istringstream iss_velocity_ids(velocity_ids);
-    while (std::getline(iss_velocity_ids, token, ',')) {
-        if (token.find_first_not_of(" \t") == std::string::npos) {
-            continue;
+    // 逗号/方括号列表 → motor id 列表（两个参数共用一套解析）。
+    const auto parse_motor_id_list = [&](const std::string& param_name) {
+        std::vector<uint8_t> parsed_ids;
+        std::string raw = get_param(param_name, "");
+        raw.erase(std::remove(raw.begin(), raw.end(), '['), raw.end());
+        raw.erase(std::remove(raw.begin(), raw.end(), ']'), raw.end());
+        std::istringstream stream(raw);
+        std::string item;
+        while (std::getline(stream, item, ',')) {
+            if (item.find_first_not_of(" \t") == std::string::npos) {
+                continue;
+            }
+            const int parsed_id = std::stoi(item);
+            if (parsed_id < 1 || parsed_id > 127) {
+                throw std::invalid_argument(param_name + " must be in [1,127]");
+            }
+            const uint8_t id = static_cast<uint8_t>(parsed_id);
+            if (std::find(motor_ids_.begin(), motor_ids_.end(), id) == motor_ids_.end()) {
+                throw std::invalid_argument(param_name + " contains motor " + std::to_string(parsed_id) +
+                                            " not present in motor_ids");
+            }
+            parsed_ids.push_back(id);
         }
-        const int parsed_id = std::stoi(token);
-        if (parsed_id < 1 || parsed_id > 127)
-            throw std::invalid_argument("velocity_motor_ids must be in [1,127]");
-        const uint8_t id = static_cast<uint8_t>(parsed_id);
-        const auto it = std::find(motor_ids_.begin(), motor_ids_.end(), id);
-        if (it == motor_ids_.end()) {
-            RCLCPP_ERROR(get_node()->get_logger(),
-                         "velocity_motor_ids contains motor %u not present in motor_ids", id);
-            return hardware_interface::CallbackReturn::ERROR;
+        return parsed_ids;
+    };
+    const std::vector<uint8_t> velocity_ids = parse_motor_id_list("velocity_motor_ids");
+    const std::vector<uint8_t> current_ids = parse_motor_id_list("current_motor_ids");
+    for (const auto id : velocity_ids) {
+        if (std::find(current_ids.begin(), current_ids.end(), id) != current_ids.end()) {
+            throw std::invalid_argument("motor " + std::to_string(id) +
+                                        " is listed in both velocity_motor_ids and current_motor_ids");
         }
-        motor_control_modes_[static_cast<size_t>(std::distance(motor_ids_.begin(), it))] =
-            ControlMode::CSV_VELOCITY;
     }
+    const auto apply_mode_override = [&](const std::vector<uint8_t>& ids, ControlMode mode) {
+        for (const auto id : ids) {
+            const auto it = std::find(motor_ids_.begin(), motor_ids_.end(), id);
+            motor_control_modes_[static_cast<size_t>(std::distance(motor_ids_.begin(), it))] = mode;
+        }
+    };
+    apply_mode_override(velocity_ids, ControlMode::CSV_VELOCITY);
+    apply_mode_override(current_ids, ControlMode::CURRENT_TORQUE);
 
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
-        if (motor_control_modes_[i] == ControlMode::CSV_VELOCITY &&
-            std::none_of(info_.joints[i].command_interfaces.begin(), info_.joints[i].command_interfaces.end(),
-                         [](const auto& interface) { return interface.name == "velocity"; }))
+        const auto declares = [&](const char* interface_name) {
+            return std::any_of(info_.joints[i].command_interfaces.begin(),
+                               info_.joints[i].command_interfaces.end(),
+                               [interface_name](const auto& interface) {
+                                   return interface.name == interface_name;
+                               });
+        };
+        if (motor_control_modes_[i] == ControlMode::CSV_VELOCITY && !declares("velocity")) {
             throw std::invalid_argument("CSV joint must declare a velocity command interface");
+        }
+        // 电流环关节：底层阻抗层要**两个**参考 —— q_d 来自 position 命令口、q̇_d 来自
+        // velocity 命令口（都由本驱动的 on_export_command_interfaces 导出）。
+        // ⚠️ **不能要求 effort**：本驱动从不读 effort 命令；而且一旦 URDF 声明了
+        //    <joint>/effort，CtrlInterfaces::detectAndSetControlMode() 在
+        //    position+velocity+effort 六项齐全时会判成 MIX，把整机切到 MIX 分支 ——
+        //    那就改变了上层行为（用户明确要求"不改变上层的设计"）。
+        if (motor_control_modes_[i] == ControlMode::CURRENT_TORQUE) {
+            if (!declares("position")) {
+                throw std::invalid_argument(
+                    "Current-loop joint must declare a position command interface (q_d reference)");
+            }
+            if (!declares("velocity")) {
+                throw std::invalid_argument(
+                    "Current-loop joint must declare a velocity command interface (q_dot_d reference)");
+            }
+        }
     }
     max_velocity_rpm_ = std::stoi(get_param("max_velocity_rpm", "32767"));
     if (max_velocity_rpm_ <= 0 || max_velocity_rpm_ > 32767) {
@@ -355,6 +414,165 @@ hardware_interface::CallbackReturn JxHardware::on_init(
                      "Parameter 'max_velocity_rpm' must be in [1,32767], got %d",
                      max_velocity_rpm_);
         return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 电流环模式专用（mA）：模块自身不平滑也不限幅，所以这两项必须在驱动里做。
+    max_current_ma_ = std::stoi(get_param("max_current_ma", "3000"));
+    if (max_current_ma_ <= 0 || max_current_ma_ > 32767) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'max_current_ma' must be in [1,32767], got %d", max_current_ma_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    current_slew_rate_ma_s_ = std::stod(get_param("current_slew_rate_ma_s", "0"));
+    if (!std::isfinite(current_slew_rate_ma_s_) || current_slew_rate_ma_s_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'current_slew_rate_ma_s' must be finite and >= 0 (0 = disabled), got %g",
+                     current_slew_rate_ma_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 逐电机反馈超时门槛（单位 = read() 拍数；CM 500 Hz ⇒ 10 拍 = 20 ms）。见 jx_hardware.h。
+    // ⚠️ 不能设成 1~2 拍：反馈是模块收到控制帧后才回的，与 CM 的 read() 天然异步，
+    //    单拍没收到是正常现象。
+    feedback_timeout_cycles_ = std::stoi(get_param("feedback_timeout_cycles", "10"));
+    if (feedback_timeout_cycles_ < 1 || feedback_timeout_cycles_ > 10000) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'feedback_timeout_cycles' must be in [1,10000], got %d",
+                     feedback_timeout_cycles_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    // ── 底层阻抗层参数（单位全部是 mA；1 个值 = 全部电机同值）──────────────────
+    const auto parse_gain_list = [&](const char* param_name, std::vector<double>& out,
+                                     bool allow_negative) {
+        std::vector<double> parsed;
+        std::string raw = get_param(param_name, "");
+        raw.erase(std::remove(raw.begin(), raw.end(), '['), raw.end());
+        raw.erase(std::remove(raw.begin(), raw.end(), ']'), raw.end());
+        std::istringstream stream(raw);
+        std::string item;
+        while (std::getline(stream, item, ',')) {
+            if (item.find_first_not_of(" \t") != std::string::npos) {
+                parsed.push_back(std::stod(item));
+            }
+        }
+        if (parsed.empty()) {
+            parsed.assign(motor_ids_.size(), 0.0);
+        } else if (parsed.size() == 1) {
+            parsed.assign(motor_ids_.size(), parsed.front());
+        } else if (parsed.size() != motor_ids_.size()) {
+            throw std::invalid_argument(std::string(param_name) + " needs one value or " +
+                                        std::to_string(motor_ids_.size()) + " values");
+        }
+        for (const double value : parsed) {
+            if (!std::isfinite(value) || (!allow_negative && value < 0.0)) {
+                throw std::invalid_argument(std::string(param_name) + " values must be finite" +
+                                            (allow_negative ? "" : " and >= 0"));
+            }
+        }
+        out = std::move(parsed);
+    };
+    parse_gain_list("impedance_kp_ma_rad", impedance_kp_ma_rad_, false);
+    parse_gain_list("impedance_kd_ma_s_rad", impedance_kd_ma_s_rad_, false);
+    parse_gain_list("friction_coulomb_ma", friction_coulomb_ma_, false);
+    parse_gain_list("friction_viscous_ma_s_rad", friction_viscous_ma_s_rad_, false);
+    parse_gain_list("friction_offset_ma", friction_offset_ma_, true);
+    parse_gain_list("gravity_feedforward_ma", gravity_feedforward_ma_, true);
+    friction_vel_eps_rad_s_ = std::stod(get_param("friction_vel_eps_rad_s", "0.002"));
+    if (!std::isfinite(friction_vel_eps_rad_s_) || friction_vel_eps_rad_s_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_vel_eps_rad_s' must be finite and >= 0, got %g",
+                     friction_vel_eps_rad_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 摩擦前馈取哪个速度 + 幅值上限（不配 = 老行为：实测速度、不限幅）。
+    const std::string ff_velocity = get_param("friction_ff_velocity", "measured");
+    if (ff_velocity != "measured" && ff_velocity != "reference") {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_ff_velocity' must be 'measured' or 'reference', got '%s'",
+                     ff_velocity.c_str());
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    friction_ff_use_reference_vel_ = (ff_velocity == "reference");
+    friction_ff_max_ma_ = std::stod(get_param("friction_ff_max_ma", "0"));
+    if (!std::isfinite(friction_ff_max_ma_) || friction_ff_max_ma_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_ff_max_ma' must be finite and >= 0 (0 = unlimited), got %g",
+                     friction_ff_max_ma_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 腰部重力前馈表（见 jx_hardware.h 里的说明）。留空 = 关闭 = 行为与从前完全一致。
+    // 它是**无控制器时唯一能把腰顶住**的东西：手臂出错 ⇒ WBC 激活不了 ⇒ 没人发位置参考、
+    // 没人补重力 ⇒ 腰 1/2/3 只剩弹簧。
+    gravity_ff_table_path_ = get_param("gravity_ff_table", "");
+    if (!loadGravityFfTable(gravity_ff_table_path_)) {
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 上层推送的【精确】重力前馈（含真实手臂姿态）——见 jx_hardware.h。留空 = 关闭。
+    gravity_ff_topic_ = get_param("gravity_ff_topic", "");
+    {
+        const std::string timeout = get_param("gravity_ff_topic_timeout_s", "0.5");
+        gravity_ff_topic_timeout_s_ = std::stod(timeout);
+        if (!std::isfinite(gravity_ff_topic_timeout_s_) || gravity_ff_topic_timeout_s_ <= 0.0) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Parameter 'gravity_ff_topic_timeout_s' must be finite and > 0, got '%s'",
+                         timeout.c_str());
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+    }
+    if (!gravity_ff_topic_.empty()) {
+        // ⚠️ 这是 controller_manager 的节点，回调跑在 CM 的 executor 上（不是 read/write
+        //    那个更新线程）。缓存用 mutex 保护；阻抗层每周期只读一次，开销可忽略。
+        gravity_ff_sub_ = get_node()->create_subscription<std_msgs::msg::Float64MultiArray>(
+            gravity_ff_topic_, rclcpp::QoS(1).best_effort(),
+            [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
+                if (!msg) {
+                    return;
+                }
+                // 话题布局：下标 = 电机 ID − 1（头部 5/6 也在里面，驱动只取自己的电机）。
+                // ⚠️ 必须**全部覆盖 + 全部有限**，任一不满足就**整条丢弃**：
+                //    短消息/NaN 会让某些轴的重力前馈变 0，而 NaN 又会被阻抗律末尾的
+                //    `if (!std::isfinite(current)) current = 0.0;` 兜底清成 **0 mA** ——
+                //    对重力关节就是自由下坠。丢弃后 stamp 不更新，超时就自然退回查表（保命层）。
+                const size_t needed =
+                    static_cast<size_t>(*std::max_element(motor_ids_.begin(), motor_ids_.end()));
+                if (msg->data.size() < needed) {
+                    RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5000,
+                                         "重力前馈话题长度 %zu < 需要的 %zu，整条丢弃（继续用查表）",
+                                         msg->data.size(), needed);
+                    return;
+                }
+                std::vector<double> by_slot(motor_ids_.size(), 0.0);
+                for (size_t i = 0; i < motor_ids_.size(); ++i) {
+                    const double v = msg->data[static_cast<size_t>(motor_ids_[i]) - 1];
+                    if (!std::isfinite(v)) {
+                        RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 5000,
+                                             "重力前馈话题含非有限值（电机 %u = %g），整条丢弃（继续用查表）",
+                                             motor_ids_[i], v);
+                        return;
+                    }
+                    by_slot[i] = v;
+                }
+                std::lock_guard<std::mutex> lock(gravity_ff_mutex_);
+                gravity_ff_topic_ma_ = std::move(by_slot);
+                gravity_ff_topic_stamp_ = std::chrono::steady_clock::now();
+            });
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "Waist gravity FF topic: %s (fresh <= %.2f s) —— 新鲜时优先于查表",
+                    gravity_ff_topic_.c_str(), gravity_ff_topic_timeout_s_);
+    }
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
+            continue;
+        }
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "Motor %u impedance layer: Kp=%.1f mA/rad, Kd=%.1f mA*s/rad, "
+                    "Coulomb=%.0f mA, viscous=%.0f mA*s/rad, offset=%.0f mA, gravity=%.0f mA, "
+                    "v_eps=%.4f rad/s, limit=+/-%d mA, slew=%.0f mA/s, ff_vel=%s, ff_max=%.0f mA",
+                    motor_ids_[i], impedance_kp_ma_rad_[i], impedance_kd_ma_s_rad_[i],
+                    friction_coulomb_ma_[i], friction_viscous_ma_s_rad_[i],
+                    friction_offset_ma_[i], gravity_feedforward_ma_[i],
+                    friction_vel_eps_rad_s_, max_current_ma_, current_slew_rate_ma_s_,
+                    friction_ff_use_reference_vel_ ? "reference" : "measured",
+                    friction_ff_max_ma_);
     }
 
     gear_ratios_.assign(motor_ids_.size(), 1.0);
@@ -393,11 +611,20 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     joint_efforts_.resize(motor_count, 0.0);
     joint_position_commands_.resize(motor_count, 0.0);
     joint_velocity_commands_.resize(motor_count, 0.0);
+    position_reference_.assign(motor_count, 0.0);
+    velocity_reference_.assign(motor_count, 0.0);
+    latched_hold_positions_.assign(motor_count, 0);
+    transmit_fault_ = false;
+    transmit_retry_started_ = {};
     raw_position_commands_.resize(motor_count, 0);
     raw_velocity_commands_.resize(motor_count, 0);
+    raw_current_commands_.resize(motor_count, 0);
     target_raw_position_commands_.resize(motor_count, 0);
     last_sent_raw_commands_.resize(motor_count, 0);
     last_sent_deltas_.resize(motor_count, 0);
+    last_sent_current_commands_.resize(motor_count, 0.0);
+    motor_unhealthy_count_.assign(motor_count, 0);
+    motor_hold_latched_.assign(motor_count, 0);   // 锁存只在这里（真正重新初始化）清
 
     running_ = false;
     is_first_command_ = true;
@@ -447,11 +674,208 @@ hardware_interface::CallbackReturn JxHardware::on_init(
 }
 
 // === 激活硬件（初始化CAN+使能电机+获取初始状态）===
+// ── 腰部重力前馈表：加载 + 插值 ─────────────────────────────────────────────
+// 为什么在驱动里算：控制器（ocs2_wbc_controller）必须同时 claim 20 个关节，手臂
+// （M6_CCS）一出错它就激活不了；而驱动照样会把腰切进电流环 ⇒ 没人补重力 ⇒ 腰 1/2/3
+// 只剩弹簧、下沉几度。只要模型在驱动里，**有没有控制器都不会沉**。
+bool JxHardware::loadGravityFfTable(const std::string &path) {
+    gravity_ff_table_n_ = 0;
+    gravity_ff_table_data_.clear();
+    gravity_ff_table_slots_.clear();
+    if (path.empty()) {
+        return true;  // 未配置 = 关闭，不是错误
+    }
+    std::ifstream in(path);
+    if (!in) {
+        RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表打不开: %s", path.c_str());
+        return false;
+    }
+    // 表列顺序固定 = 电机 ID 1,2,3,4（= body_joint1~4），找出它们在本驱动里的下标
+    for (const uint8_t id : {static_cast<uint8_t>(1), static_cast<uint8_t>(2),
+                             static_cast<uint8_t>(3), static_cast<uint8_t>(4)}) {
+        const auto it = std::find(motor_ids_.begin(), motor_ids_.end(), id);
+        gravity_ff_table_slots_.push_back(
+            it == motor_ids_.end() ? -1 : static_cast<int>(std::distance(motor_ids_.begin(), it)));
+    }
+    if (std::find(gravity_ff_table_slots_.begin(), gravity_ff_table_slots_.end(), -1) !=
+        gravity_ff_table_slots_.end()) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "重力前馈表需要电机 ID 1,2,3,4 全部在本驱动的 motor_ids 里，实际个数=%zu",
+                     motor_ids_.size());
+        return false;
+    }
+
+    std::string line;
+    // 只取非空、且不以 '#' 开头的行
+    const auto next_data_line = [&](std::string &out) -> bool {
+        while (std::getline(in, line)) {
+            const auto pos = line.find_first_not_of(" \t\r");
+            if (pos == std::string::npos || line[pos] == '#') {
+                continue;
+            }
+            out = line.substr(pos);
+            return true;
+        }
+        return false;
+    };
+
+    std::string first;
+    if (!next_data_line(first)) {
+        RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表没有数据行: %s", path.c_str());
+        return false;
+    }
+    int n1 = 0, n2 = 0, n3 = 0;
+    {
+        std::istringstream ss(first);
+        if (!(ss >> n1 >> n2 >> n3) || n1 < 2 || n1 != n2 || n2 != n3) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "重力前馈表头必须是正方网格 'n n n'（且 n>=2），读到 '%s'", first.c_str());
+            return false;
+        }
+    }
+    const auto read3 = [&](double *dst) -> bool {
+        std::string l;
+        if (!next_data_line(l)) {
+            return false;
+        }
+        std::istringstream ss(l);
+        return static_cast<bool>(ss >> dst[0] >> dst[1] >> dst[2]);
+    };
+    if (!read3(gravity_ff_table_lo_) || !read3(gravity_ff_table_hi_)) {
+        RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表缺 lo/hi 行: %s", path.c_str());
+        return false;
+    }
+
+    const size_t n = static_cast<size_t>(n1);
+    gravity_ff_table_data_.assign(n * n * n * 4, 0.0F);
+    std::vector<char> seen(n * n * n, 0);
+    size_t filled = 0;
+    while (next_data_line(line)) {
+        std::istringstream ss(line);
+        int i1 = 0, i2 = 0, i3 = 0;
+        double v0 = 0.0, v1 = 0.0, v2 = 0.0, v3 = 0.0;
+        if (!(ss >> i1 >> i2 >> i3 >> v0 >> v1 >> v2 >> v3)) {
+            continue;
+        }
+        if (i1 < 0 || i2 < 0 || i3 < 0 || i1 >= n1 || i2 >= n2 || i3 >= n3) {
+            RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表下标越界: '%s'", line.c_str());
+            return false;
+        }
+        const size_t cell = (static_cast<size_t>(i1) * n + static_cast<size_t>(i2)) * n +
+                            static_cast<size_t>(i3);
+        // ⚠️ 重复点会「捷足先登」：重复点 + 缺失点让 filled 仍然等于 n³，但缺失点会
+        //    留着 assign() 的 0 ⇒ 该点周围插值出一个错误的「无重力」值。
+        if (seen[cell]) {
+            RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表有重复网格点 (%d,%d,%d): '%s'",
+                         i1, i2, i3, line.c_str());
+            return false;
+        }
+        // ⚠️ 必须校验有限性：`ss >> double` 会接受 nan/inf，而 NaN 一旦进到阻抗律会被
+        //    `isfinite` 兜底清成 0 mA ⇒ 重力关节自由下坠。
+        if (!std::isfinite(v0) || !std::isfinite(v1) || !std::isfinite(v2) ||
+            !std::isfinite(v3)) {
+            RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表含非有限值: '%s'", line.c_str());
+            return false;
+        }
+        seen[cell] = 1;
+        const size_t base = cell * 4;
+        gravity_ff_table_data_[base + 0] = static_cast<float>(v0);
+        gravity_ff_table_data_[base + 1] = static_cast<float>(v1);
+        gravity_ff_table_data_[base + 2] = static_cast<float>(v2);
+        gravity_ff_table_data_[base + 3] = static_cast<float>(v3);
+        ++filled;
+    }
+    if (filled != n * n * n) {
+        RCLCPP_ERROR(get_node()->get_logger(), "重力前馈表不完整：期望 %zu 行，实际 %zu 行",
+                     n * n * n, filled);
+        return false;
+    }
+    gravity_ff_table_n_ = n1;
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Waist gravity FF table loaded: %s  n=%d  q=(%zu,%zu,%zu)  "
+                "lo=(%.3f, %.3f, %.3f) hi=(%.3f, %.3f, %.3f)  slots=[%d %d %d %d]",
+                path.c_str(), n1, n * n * n, n, n, gravity_ff_table_lo_[0],
+                gravity_ff_table_lo_[1], gravity_ff_table_lo_[2], gravity_ff_table_hi_[0],
+                gravity_ff_table_hi_[1], gravity_ff_table_hi_[2], gravity_ff_table_slots_[0],
+                gravity_ff_table_slots_[1], gravity_ff_table_slots_[2], gravity_ff_table_slots_[3]);
+    return true;
+}
+
+bool JxHardware::gravityFeedforwardFromTable(std::vector<double> &out_ma) const {
+    if (gravity_ff_table_n_ < 2 || gravity_ff_table_data_.empty() ||
+        gravity_ff_table_slots_.size() != 4) {
+        return false;
+    }
+    const int n = gravity_ff_table_n_;
+    // 表只用腰 1/2/3 的角度（body_joint4 是 yaw，整圈对 τ_g1..3 的影响 ≤0.86°，已忽略）
+    double q[3] = {0.0, 0.0, 0.0};
+    for (int k = 0; k < 3; ++k) {
+        const int slot = gravity_ff_table_slots_[static_cast<size_t>(k)];
+        if (slot >= 0 && static_cast<size_t>(slot) < joint_positions_.size()) {
+            q[k] = joint_positions_[static_cast<size_t>(slot)];
+        }
+    }
+    int i0[3] = {0, 0, 0};
+    double f[3] = {0.0, 0.0, 0.0};
+    for (int k = 0; k < 3; ++k) {
+        const double span = gravity_ff_table_hi_[k] - gravity_ff_table_lo_[k];
+        double u = span != 0.0 ? (q[k] - gravity_ff_table_lo_[k]) / span * (n - 1) : 0.0;
+        u = std::clamp(u, 0.0, static_cast<double>(n - 1));  // 超出表的行程就取边界
+        const int iu = static_cast<int>(std::floor(u));
+        i0[k] = std::min(iu, n - 2);
+        f[k] = u - static_cast<double>(i0[k]);
+    }
+    out_ma.assign(motor_ids_.size(), 0.0);
+    for (int da = 0; da <= 1; ++da) {
+        for (int db = 0; db <= 1; ++db) {
+            for (int dc = 0; dc <= 1; ++dc) {
+                const double wgt = (da ? f[0] : 1.0 - f[0]) * (db ? f[1] : 1.0 - f[1]) *
+                                   (dc ? f[2] : 1.0 - f[2]);
+                if (wgt == 0.0) {
+                    continue;
+                }
+                const size_t base =
+                    ((static_cast<size_t>(i0[0] + da) * n + static_cast<size_t>(i0[1] + db)) * n +
+                     static_cast<size_t>(i0[2] + dc)) * 4;
+                for (size_t c = 0; c < 4; ++c) {
+                    const int slot = gravity_ff_table_slots_[c];
+                    if (slot >= 0) {
+                        out_ma[static_cast<size_t>(slot)] +=
+                            wgt * static_cast<double>(gravity_ff_table_data_[base + c]);
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool JxHardware::gravityFeedforwardFromTopic(std::vector<double> &out_ma) const {
+    std::lock_guard<std::mutex> lock(gravity_ff_mutex_);
+    if (gravity_ff_topic_ma_.empty()) {
+        return false;
+    }
+    const auto age = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                   gravity_ff_topic_stamp_)
+                         .count();
+    if (age < 0.0 || age > gravity_ff_topic_timeout_s_) {
+        return false;  // 过期 ⇒ 退回查表（不叠加，避免重复补偿）
+    }
+    out_ma = gravity_ff_topic_ma_;
+    return true;
+}
+
 hardware_interface::CallbackReturn JxHardware::on_activate(
     const rclcpp_lifecycle::State & /* previous_state */) {
     RCLCPP_INFO(get_node()->get_logger(), "Activating JxHardware...");
     locked_feedback_len_ = 0;
     is_first_command_ = true;
+    // 重新激活 = 新一轮控制会话：只清**反馈健康度计数**（给每个电机一个新的窗口）。
+    // ⚠️ **不清 `motor_hold_latched_`**：锁存的含义是「这条反馈通道不可信」，重新激活并没有
+    //    让通道变可信。它在 on_init（真正重新初始化）时才清。
+    //    反之若在这里清掉，被锁存的轴会带着故障后的 CSP 模式重新开始跟随上层命令 ——
+    //    电流阻抗轴会静默变成 CSP 轴（而且用不可信的反馈去算电流）。
+    motor_unhealthy_count_.assign(motor_ids_.size(), 0);
 
     // 初始化CAN FD接口（启用1M/5M速率）
     if (!initCanFd()) {
@@ -476,6 +900,26 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         return hardware_interface::CallbackReturn::ERROR;
     }
 
+    // 打印当前姿态下的重力前馈插值值（**不依赖任何控制器**），便于与离线
+    // `scripts/gen_waist_gravity_table.py` 打印的「核对用」数字逐位对照。
+    if (gravity_ff_table_n_ >= 2) {
+        std::vector<double> gtab;
+        if (gravityFeedforwardFromTable(gtab)) {
+            std::string msg;
+            for (size_t i = 0; i < motor_ids_.size() && i < gtab.size(); ++i) {
+                if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
+                    continue;
+                }
+                msg += (msg.empty() ? "" : ", ") + std::string("M") +
+                       std::to_string(static_cast<int>(motor_ids_[i])) + "=" +
+                       std::to_string(static_cast<long>(std::lround(gtab[i]))) + "mA";
+            }
+            RCLCPP_INFO(get_node()->get_logger(),
+                        "Waist gravity FF at current pose (driver-side, no controller needed): [%s]",
+                        msg.c_str());
+        }
+    }
+
     if (hasVelocityControl() && locked_feedback_len_ != 12) {
         RCLCPP_ERROR(get_node()->get_logger(),
                      "CSV velocity mode requires 12-byte feedback; detected %u bytes",
@@ -485,19 +929,25 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         return hardware_interface::CallbackReturn::ERROR;
     }
     
+    transmit_fault_ = false;
+    transmit_retry_started_ = {};
     // 初始化命令缓冲区（从当前反馈起步，避免首帧跃迁）
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
         joint_position_commands_[i] = joint_positions_[i]; // 弧度
-        double angle_deg = joint_positions_[i] * 180.0 / M_PI; // 弧度→角度
-        raw_position_commands_[i] = angleToInt16(angle_deg); // 角度→电机计数
-        target_raw_position_commands_[i] = raw_position_commands_[i];
-        last_sent_raw_commands_[i] = raw_position_commands_[i];
-        last_sent_deltas_[i] = 0;
+        resetPositionTarget(i);
+        position_reference_[i] = joint_positions_[i];
+        velocity_reference_[i] = 0.0;
         joint_velocity_commands_[i] = 0.0;
         raw_velocity_commands_[i] = 0;
     }
-
-    // 启动控制线程
+    // q_d 已经 = 当前实测位置 ⇒ 第一帧 write() 里弹簧项为 0，上电时腰不会自己动。
+    // 电流斜率限制的**起点**取实测 Iq 反馈（模块此刻真的在输出的电流），而不是 0、也不是
+    // 上一轮的残留值 ⇒ 即使配了 current_slew_rate_ma_s_，也是从“电机现在在输出多少”开始
+    // 爬，不会先蹦到残留值。（12 字节反馈的 data[4..5] 就是 Iq，单位 mA。）
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        last_sent_current_commands_[i] = joint_efforts_[i];
+    }
+    // 启动控制线程（固定 control_period_ms_ 节奏发帧，与 CM 的 update_rate 无关）
     running_ = true;
     control_thread_ = std::thread(&JxHardware::controlLoop, this);
 
@@ -505,7 +955,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
     return hardware_interface::CallbackReturn::SUCCESS;
 }
 
-// === 停用硬件（停止线程+关闭CAN）===
+// === 停用硬件（把电机切回 CSP 保持位置 + 关闭 CAN）===
 hardware_interface::CallbackReturn JxHardware::on_deactivate(
     const rclcpp_lifecycle::State & /* previous_state */) {
     RCLCPP_INFO(get_node()->get_logger(), "Deactivating JxHardware...");
@@ -514,6 +964,8 @@ hardware_interface::CallbackReturn JxHardware::on_deactivate(
     if (control_thread_.joinable()) {
         control_thread_.join();
     }
+    // 切回 CSP 的帧是否至少提交成功。全部失败时返回 ERROR（不能宣称“已进入位置保持”）。
+    bool csp_switch_send_failed = false;
 
     if (can_socket_ >= 0) {
         {
@@ -521,14 +973,60 @@ hardware_interface::CallbackReturn JxHardware::on_deactivate(
             std::fill(joint_velocity_commands_.begin(), joint_velocity_commands_.end(), 0.0);
             std::fill(raw_velocity_commands_.begin(), raw_velocity_commands_.end(), 0);
         }
-        if (hasVelocityControl()) {
-            (void)sendMultiMotorCommand();
+        // ⚠️ 退电流环/CSV 前**必须先把电机切回 CSP（target = 当前位置）**，否则关掉 CAN
+        //    之后模块会停在电流环上：它保持的是**最后一个电流命令**，而腰部是重力载荷
+        //    ⇒ 只要上层一停（手臂出错把 juxie 一起拉下水停掉、或正常 Ctrl-C），腰就失去
+        //    位置保持。切回 CSP 后模块用自己的位置环抱住当前位置，是自包含、最安全的状态。
+        //    背景：2026-10-13 真机，手臂报错 → CM 停掉 juxie → 腰留在电流环里。
+        // ⚠️ **无条件**把全部电机切回 CSP（target = 当前位置）再发几帧。
+        //    不要在这里加“只有配了 CSV/电流环才需要切”之类的判断：锁存会把电机的模式改成
+        //    CSP，拿模式去判断就会漏切，而模块其实还停在电流环上执行最后一条电流命令
+        //    （2026-10-13 事故的形态）。对本来就是 CSP 的配置，多切一次是零成本空操作。
+        std::vector<ControlMode> saved_modes;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            saved_modes = motor_control_modes_;
+            for (size_t i = 0; i < motor_control_modes_.size(); ++i) {
+                motor_control_modes_[i] = ControlMode::CSP_POSITION;
+                resetPositionTarget(i);
+            }
+        }
+        // 模式切换是异步的（实测滞后 2~3 帧），发一帧不一定真切过去 ⇒ 多发几帧。
+        // ⚠️ 控制线程已 join，但**不能**假定这里独占 motor_control_modes_：本函数跑在 CM
+        //    的 executor 线程上，更新循环（write()）可能还差一拍才停下 ⇒ 所有访问都在
+        //    state_mutex_ 里（sendMultiMotorCommand() 自己加锁，别在锁内调它）。
+        // ⚠️ 检查返回值：「尝试发了」不等于「确实提交出去了」—— CAN 写失败时模块会继续执行
+        //    最后一条电流命令。
+        int sent_ok = 0;
+        for (int k = 0; k < 3; ++k) {
+            if (sendMultiMotorCommand()) {
+                ++sent_ok;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (sent_ok == 0) {
+            csp_switch_send_failed = true;
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "切回 CSP 的 3 帧**全部提交失败**（CAN 写失败）⇒ 不保证电机已进入"
+                         "位置保持。");
+        }
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            for (size_t i = 0; i < motor_control_modes_.size(); ++i) {
+                // A failed shutdown send may have latched another motor.
+                motor_control_modes_[i] = motor_hold_latched_[i]
+                    ? ControlMode::CSP_POSITION : saved_modes[i];
+            }
         }
         ::close(can_socket_);
         can_socket_ = -1;
     }
 
+    if (csp_switch_send_failed) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "JxHardware deactivated（⚠️ 切回 CSP 的帧全部发送失败）");
+        return hardware_interface::CallbackReturn::ERROR;
+    }
     RCLCPP_INFO(get_node()->get_logger(), "JxHardware deactivated");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -570,6 +1068,14 @@ JxHardware::on_export_command_interfaces() {
                 std::make_shared<hardware_interface::CommandInterface>(
                     joint_name, hardware_interface::HW_IF_VELOCITY, &joint_velocity_commands_[i]));
         }
+        // 电流环模式：额外导出 velocity 命令口 —— 它是**速度参考 q̇_d**（供底层阻抗层用），
+        // 不是电机速度命令。**不要导出 effort**：否则 CtrlInterfaces 的 MIX 自动检测
+        // 会把整机切到 MIX 分支，反而改变了上层行为。
+        if (motor_control_modes_[i] == ControlMode::CURRENT_TORQUE) {
+            command_interfaces.push_back(
+                std::make_shared<hardware_interface::CommandInterface>(
+                    joint_name, hardware_interface::HW_IF_VELOCITY, &joint_velocity_commands_[i]));
+        }
     }
     RCLCPP_INFO(get_node()->get_logger(), "Exported %zu command interfaces (%s)",
                 command_interfaces.size(), controlModeName());
@@ -579,9 +1085,13 @@ JxHardware::on_export_command_interfaces() {
 // === ROS2 Control 读写接口 ===
 hardware_interface::return_type JxHardware::read(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
+    if (transmit_fault_.load()) {
+        RCLCPP_ERROR(get_node()->get_logger(), "CAN transmit fault latched; requesting hardware error handling");
+        return hardware_interface::return_type::ERROR;
+    }
     if (!readMotorStates(false))
     {
-        RCLCPP_ERROR(get_node()->get_logger(), "motor error ,return");
+        RCLCPP_ERROR(get_node()->get_logger(), "Motor feedback/status failure; requesting hardware error handling");
         return hardware_interface::return_type::ERROR;
     }
     else
@@ -598,22 +1108,38 @@ hardware_interface::return_type JxHardware::write(
     const rclcpp::Time & /* time */, const rclcpp::Duration & /* period */) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
-    // Validate before conversion to integer protocol units.
+    if (transmit_fault_.load()) return hardware_interface::return_type::ERROR;
+    // Validate the complete snapshot before publishing any of it.
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
-        const double command = motor_control_modes_[i] == ControlMode::CSV_VELOCITY
-            ? joint_velocity_commands_[i] : joint_position_commands_[i];
-        if (!std::isfinite(command)) {
+        if (motor_hold_latched_[i]) continue;
+        // 位置参考（CSP / 电流环）与速度参考（CSV / 电流环）都要是有限值。
+        const bool needs_velocity = motor_control_modes_[i] == ControlMode::CSV_VELOCITY ||
+                                    motor_control_modes_[i] == ControlMode::CURRENT_TORQUE;
+        if (!std::isfinite(joint_position_commands_[i]) ||
+            (needs_velocity && !std::isfinite(joint_velocity_commands_[i]))) {
             std::fill(raw_velocity_commands_.begin(), raw_velocity_commands_.end(), 0);
-            RCLCPP_ERROR(get_node()->get_logger(), "Non-finite command for motor %u", motor_ids_[i]);
+            // ⚠️ 刻意**不**清 raw_current_commands_：那是给电流环电机下发的力矩，清零 =
+            //    重力关节自由下坠。这里只上报错误，由 CM 走 on_deactivate（它会先把电机
+            //    切回 CSP 保持位置，是自包含的安全终态）。
+            RCLCPP_ERROR(get_node()->get_logger(), "Non-finite command for motor %u",
+                         motor_ids_[i]);
             return hardware_interface::return_type::ERROR;
         }
     }
-    // 更新最新目标；实际下发由独立控制线程完成。
+
+    // 更新最新目标（CSP 的目标计数 / CSV 的电机 rpm）；实际下发由控制线程完成。
     for (size_t i = 0; i < joint_position_commands_.size(); ++i) {
+        // 已锁存为 CSP 保持的电机：忽略上层命令，别把它再拉回 q_d（反馈不可信时那样做很危险）
+        if (i < motor_hold_latched_.size() && motor_hold_latched_[i]) {
+            continue;
+        }
+        position_reference_[i] = joint_position_commands_[i];
+        velocity_reference_[i] = motor_control_modes_[i] == ControlMode::CSP_POSITION
+            ? 0.0 : joint_velocity_commands_[i];
         if (motor_control_modes_[i] == ControlMode::CSP_POSITION) {
             const double angle_deg = joint_position_commands_[i] * 180.0 / M_PI;
             target_raw_position_commands_[i] = angleToInt16(angle_deg);
-        } else {
+        } else if (motor_control_modes_[i] == ControlMode::CSV_VELOCITY) {
             const double motor_rpm = joint_velocity_commands_[i] * 60.0 /
                                      (2.0 * M_PI) * gear_ratios_[i];
             const long rounded = std::lround(std::clamp(
@@ -621,6 +1147,8 @@ hardware_interface::return_type JxHardware::write(
                 static_cast<double>(max_velocity_rpm_)));
             raw_velocity_commands_[i] = static_cast<int16_t>(rounded);
         }
+        // 电流环关节不在这里换算：position/velocity 命令口是**参考**，
+        // 真正的电流由控制线程里的 sendMultiMotorCommand() 阻抗层算（见那里）。
     }
 
     return hardware_interface::return_type::OK;
@@ -673,25 +1201,6 @@ bool JxHardware::initCanFd() {
     return true;
 }
 
-// === 电机使能 ===
-bool JxHardware::enableMotors() {
-    uint8_t enable_cmd[] = {0x2B, 0x40, 0x60, 0x00, 0x0F, 0x00, 0x00, 0x00};
-    for (uint8_t id : motor_ids_) {
-        struct canfd_frame frame;
-        memset(&frame, 0, sizeof(frame));
-        frame.can_id = static_cast<canid_t>(0x600 + id);
-        frame.len = 8;
-        memcpy(frame.data, enable_cmd, 8);
-        if (::write(can_socket_, &frame, sizeof(frame)) != sizeof(frame)) {
-            RCLCPP_ERROR(get_node()->get_logger(), "Enable motor %d failed", id);
-            ::close(can_socket_);
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return true;
-}
-
 // === 发送同步帧 ===
 bool JxHardware::sendSyncFrame() {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -716,6 +1225,13 @@ bool JxHardware::sendSyncFrame() {
 // === 发送多控帧（协议0x200，控制多个电机）===
 bool JxHardware::sendMultiMotorCommand() {
     std::lock_guard<std::mutex> lock(state_mutex_);
+
+    // ⚠️ 这里**不要**再加「反馈年龄」看门狗（曾有过，已删）：它按墙钟判「最近 N ms
+    //    没收到健康帧」，而 CM 在**别的组件**做生命周期切换时会一直持有 RM 的锁 ⇒
+    //    read()/write() 被 trylock 跳过（实测 M6_CCS 激活占 1.78 s）⇒「CM 还没 read
+    //    我」与「CM 挂了」根本无法区分，启动必然误判并把整条腰锁死。
+    //    按拍计数（motor_unhealthy_count_ + feedback_timeout_cycles_）由 read() 驱动，
+    //    对这个场景天然免疫、且理由准确 —— 用它。
 
     // 限速 + 限加速追赶最新目标：
     // 1) 速度：每周期 |delta| <= max_position_step_nct_
@@ -757,25 +1273,106 @@ bool JxHardware::sendMultiMotorCommand() {
         last_sent_raw_commands_[i] = raw_position_commands_[i];
     }
 
+    // ── 底层阻抗层：把上层的（位置, 速度）参考换成电流（mA）────────────────────
+    //   I = Kp·(q_d − q) + Kd·(q̇_d − q̇) + g_ff + f_off + FF
+    // 上层（OCS2/WBC）照旧只发位置/速度，换算在这里（每个 write() 一次 = CM update_rate）。
+    //   FF = 0                                         当 |v_ff| < v_eps
+    //      = sign(v_ff)·min(f_c + f_v·|v_ff|, ff_max)   否则
+    //   v_ff：默认取**实测速度**；friction_ff_velocity=reference 时，|q̇_d| >= v_eps
+    //         就改用**参考速度**（换向时抢先一步，真机跟踪误差实测好 2.4×），
+    //         否则仍退回实测速度（被外力推动时前馈不会归零）。
+    // 速度死区避免静止时的 1 rpm 量化噪声造成“正反馈自激”式抖动。
+    // 腰部重力前馈，两层（**取其一，不叠加**）：
+    //   ① 控制器活着 → 话题值（含真实手臂姿态，精确）
+    //   ② 否则       → 驱动自己的查表（标称手臂姿态；不依赖任何控制器，保命）
+    std::vector<double> gravity_topic_ma;
+    const bool has_gravity_topic = gravityFeedforwardFromTopic(gravity_topic_ma);
+    std::vector<double> gravity_table_ma;
+    const bool has_gravity_table =
+        !has_gravity_topic && gravityFeedforwardFromTable(gravity_table_ma);
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
+            continue;
+        }
+        // Sender only reads the snapshot committed by write().
+        const double q = joint_positions_[i];
+        const double q_d = position_reference_[i];
+        const double v = joint_velocities_[i];
+        const double v_d = velocity_reference_[i];
+        const double gravity_auto_i =
+            has_gravity_topic
+                ? (i < gravity_topic_ma.size() ? gravity_topic_ma[i] : 0.0)
+                : ((has_gravity_table && i < gravity_table_ma.size()) ? gravity_table_ma[i] : 0.0);
+        double current = impedance_kp_ma_rad_[i] * (q_d - q) +
+                         impedance_kd_ma_s_rad_[i] * (v_d - v) +
+                         gravity_feedforward_ma_[i] + gravity_auto_i + friction_offset_ma_[i];
+        const double v_ff = (friction_ff_use_reference_vel_ &&
+                             std::abs(v_d) >= friction_vel_eps_rad_s_) ? v_d : v;
+        if (std::abs(v_ff) >= friction_vel_eps_rad_s_) {
+            const double sign_v = v_ff > 0.0 ? 1.0 : -1.0;
+            double friction_ff = friction_coulomb_ma_[i] +
+                                 friction_viscous_ma_s_rad_[i] * std::abs(v_ff);
+            if (friction_ff_max_ma_ > 0.0) {
+                friction_ff = std::min(friction_ff, friction_ff_max_ma_);
+            }
+            current += sign_v * friction_ff;
+        }
+        if (!std::isfinite(current)) {
+            current = 0.0;
+        }
+        raw_current_commands_[i] = static_cast<int16_t>(std::clamp(
+            std::lround(current), -static_cast<long>(max_current_ma_),
+            static_cast<long>(max_current_ma_)));
+    }
+
     uint8_t data[CANFD_MAX_LEN] = {0};
+    // 电流环：变化率限制（模块自身不平滑电流），按控制线程的固定周期折算每帧允许的增量。
+    const double dt_s = static_cast<double>(control_period_ms_) * 1e-3;
+    // ⚠️ 重新激活时不需要特殊处理：on_activate() 已经把 last_sent_current_commands_
+    //    初始化成**实测 Iq 反馈**，所以这里永远从“电机真的在输出多少”开始爬。
+    if (current_slew_rate_ma_s_ > 0.0) {
+        const double max_step_ma = current_slew_rate_ma_s_ * dt_s;
+        for (size_t i = 0; i < motor_ids_.size(); ++i) {
+            if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
+                continue;
+            }
+            const double target = static_cast<double>(raw_current_commands_[i]);
+            const double last = last_sent_current_commands_[i];
+            const double limited = last + std::clamp(target - last, -max_step_ma, max_step_ma);
+            last_sent_current_commands_[i] = limited;
+            raw_current_commands_[i] = static_cast<int16_t>(std::clamp(
+                std::lround(limited), -static_cast<long>(max_current_ma_),
+                static_cast<long>(max_current_ma_)));
+        }
+    } else {
+        for (size_t i = 0; i < motor_ids_.size(); ++i) {
+            if (motor_control_modes_[i] == ControlMode::CURRENT_TORQUE) {
+                last_sent_current_commands_[i] = static_cast<double>(raw_current_commands_[i]);
+            }
+        }
+    }
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         int pkg_offset = i * 7;
         const bool is_position = motor_control_modes_[i] == ControlMode::CSP_POSITION;
+        const bool is_velocity = motor_control_modes_[i] == ControlMode::CSV_VELOCITY;
         const uint8_t control_byte = locked_feedback_len_ == 7
             ? (is_first_command_ ? 0xD8 : 0xD0)
             : (is_position
                 ? (is_first_command_ ? CTRL_WORD_CSP_CLEAR : CTRL_WORD_CSP)
-                : (is_first_command_ ? CTRL_WORD_CSV_CLEAR : CTRL_WORD_CSV));
+                : (is_velocity
+                    ? (is_first_command_ ? CTRL_WORD_CSV_CLEAR : CTRL_WORD_CSV)
+                    : (is_first_command_ ? CTRL_WORD_CURRENT_CLEAR : CTRL_WORD_CURRENT)));
         const int16_t raw_command = is_position
-            ? raw_position_commands_[i] : raw_velocity_commands_[i];
+            ? raw_position_commands_[i]
+            : (is_velocity ? raw_velocity_commands_[i] : raw_current_commands_[i]);
         const uint16_t encoded = static_cast<uint16_t>(raw_command);
         data[pkg_offset + 0] = control_byte;
         data[pkg_offset + 1] = (encoded >> 8) & 0xFF;
         data[pkg_offset + 2] = encoded & 0xFF;
-        data[pkg_offset + 3] = 0x00; // 目标参数2，CSP模式下不使用
+        data[pkg_offset + 3] = 0x00; // 目标参数2（位置/速度模式下为轮廓加减速，本驱动不用）
         data[pkg_offset + 4] = 0x00;
-        data[pkg_offset + 5] = 0x00; // 目标前馈参数，CSP模式下不使用
+        data[pkg_offset + 5] = 0x00; // 目标前馈参数（电流环模式下为任意值）
         data[pkg_offset + 6] = 0x00;
         // === 新协议适配 END ===
     }
@@ -791,11 +1388,36 @@ bool JxHardware::sendMultiMotorCommand() {
     frame.can_id = static_cast<canid_t>(MULTI_CTRL_ID);
     frame.len = CANFD_MAX_LEN;
     memcpy(frame.data, data, CANFD_MAX_LEN);
-    if (::write(can_socket_, &frame, sizeof(frame)) != sizeof(frame)) {
-        RCLCPP_ERROR(get_node()->get_logger(), "Multi-motor command failed: %s", strerror(errno));
+    const auto bytes = ::write(can_socket_, &frame, sizeof(frame));
+    if (bytes != sizeof(frame)) {
+        const int send_errno = bytes < 0 ? errno : EIO;
+        const bool retryable = send_errno == EAGAIN || send_errno == EWOULDBLOCK ||
+                               send_errno == ENOBUFS || send_errno == EINTR;
+        const auto now = std::chrono::steady_clock::now();
+        // Retry transient congestion at the normal send cadence, without busy looping.
+        // Bound a continuous failure episode so a broken bus cannot be hidden forever.
+        constexpr auto retry_window = std::chrono::milliseconds(100);
+        if (retryable && !transmit_fault_.load()) {
+            if (transmit_retry_started_.time_since_epoch().count() == 0)
+                transmit_retry_started_ = now;
+            if (now - transmit_retry_started_ < retry_window) {
+                RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+                    "Transient CAN send failure (%s); retrying, command delivery unconfirmed",
+                    strerror(send_errno));
+                return false;
+            }
+        }
+        transmit_fault_.store(true);
+        // Local desired state only: a failed bus cannot deliver this CSP request.
+        for (size_t i = 0; i < motor_ids_.size(); ++i)
+            latchMotorToCspHold(i, "CAN transmit fault");
+        RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+            "CAN transmit fault (%s); CSP hold requested locally, delivery/mode unconfirmed; "
+            "motor may still execute the last current command", strerror(send_errno));
         return false;
     }
-    
+    transmit_retry_started_ = {};
+
     // 第一次发送后更新标志
     if (is_first_command_) {
         RCLCPP_INFO(get_node()->get_logger(), "Sent first %s command", controlModeName());
@@ -811,8 +1433,6 @@ bool JxHardware::readMotorStates(bool strict_check) {
 
     // 创建临时映射表存储最新反馈
     std::unordered_map<uint8_t, canfd_frame> feedback_map;
-    // 存储错误帧的映射表
-    std::unordered_map<uint8_t, canfd_frame> error_frames_map;
 
     struct canfd_frame frame;
 
@@ -843,7 +1463,6 @@ bool JxHardware::readMotorStates(bool strict_check) {
             } else if (frame.can_id >= 0x80 && frame.can_id < 0x80 + 256) {
                 uint8_t motor_id = frame.can_id - 0x80;
                 if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
-                    error_frames_map[motor_id] = frame;
                     parseAndReportEmergencyFrame(motor_id, frame);
                     running_ = false;
                     return false;
@@ -901,6 +1520,13 @@ bool JxHardware::readMotorStates(bool strict_check) {
         locked_feedback_len_ = first_len;
         RCLCPP_INFO(get_node()->get_logger(),
                     "Locked feedback frame length to %u bytes", locked_feedback_len_);
+        if (locked_feedback_len_ == 7 && hasCurrentControl()) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Current-loop mode requires the 12-byte feedback protocol (mode echo + Iq in mA), "
+                         "but this module answers with 7-byte frames");
+            running_ = false;
+            return false;
+        }
     }
 
     // 处理缓存的反馈数据
@@ -909,6 +1535,8 @@ bool JxHardware::readMotorStates(bool strict_check) {
         auto it = feedback_map.find(id);
         
         if (it != feedback_map.end()) {
+            // ⚠️ 健康计数**不在这里**清零：收到帧 ≠ 帧健康。下面 enable/error 检查之后才
+            //    决定清不清（否则「持续未使能」的计数器每拍被清一次，永远到不了阈值）。
             const canfd_frame& frame = it->second;
             if (locked_feedback_len_ > 0 && frame.len != locked_feedback_len_) {
                 RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
@@ -924,6 +1552,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                        1000, "Feedback for motor %d has insufficient data length: %d (<12)",
                                        id, frame.len);
+                    ++motor_unhealthy_count_[i];   // 帧不可解析 = 不健康
                     continue;
                 }
                 int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
@@ -937,23 +1566,20 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 joint_efforts_[i] = static_cast<double>(raw_current); // 新协议反馈Iq电流，单位mA
 
                 uint16_t error_code = frame.data[6] | (static_cast<uint16_t>(frame.data[7]) << 8);
-                uint8_t mode_feedback = frame.data[10];
                 uint8_t status_byte = frame.data[11];
                 bool enable = (status_byte & 0x80) != 0;
                 bool error = (status_byte & 0x20) != 0 || error_code != 0;
 
                 if (!enable) {
+                    // 电机自称「未使能」：对电流环/重力关节而言等于「已经在掉」，而驱动却还
+                    // 继续按旧位置给它发电流。只 WARN 不够 —— 计入健康度，超时后锁存成 CSP 保持。
+                    ++motor_unhealthy_count_[i];
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                        5000, "Motor %d is not enabled", id);
                 }
-                const uint8_t expected_mode = motor_control_modes_[i] == ControlMode::CSV_VELOCITY
-                    ? 0x04 : 0x03;
-                if (mode_feedback != expected_mode) {
-                    RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                        5000, "Motor %d mode feedback is 0x%02X, expected 0x%02X (%s)",
-                                        id, mode_feedback, expected_mode,
-                                        motor_control_modes_[i] == ControlMode::CSV_VELOCITY
-                                            ? "CSV velocity" : "CSP position");
+                else {
+                    // 只有「使能且无错」的帧才清零健康计数（否则持续异常会累不上去）
+                    motor_unhealthy_count_[i] = 0;
                 }
                 if (error) {
                     if (error_code != 0) {
@@ -970,6 +1596,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                        1000, "Feedback for motor %d has insufficient data length: %d (<7)",
                                        id, frame.len);
+                    ++motor_unhealthy_count_[i];   // 帧不可解析 = 不健康
                     continue;
                 }
                 int16_t raw_pos = (frame.data[0] << 8) | frame.data[1];
@@ -985,8 +1612,12 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 bool error = (status_byte & 0x08) != 0;
 
                 if (!enable) {
+                    ++motor_unhealthy_count_[i];
                     RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
                                        5000, "Motor %d is not enabled", id);
+                }
+                else {
+                    motor_unhealthy_count_[i] = 0;
                 }
                 if (error) {
                     RCLCPP_ERROR_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
@@ -1002,12 +1633,72 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 return false;
             }
         } else {
-            RCLCPP_DEBUG_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(),
-                                1000, "No feedback for motor %d", id);
+            // 这一拍没回帧。**不能**继续拿旧位置/旧速度算电流（`Kp·(q_d − q_旧)` 会一路
+            // 涨到限幅），也不能把电流置 0（重力关节 = 自由落体）。只累加计数，
+            // 连续超过 feedback_timeout_cycles_ 就在下面把它锁存成 CSP 保持。
+            ++motor_unhealthy_count_[i];
+            if (motor_unhealthy_count_[i] == 1) {
+                // 单拍缺失是**正常**的（模块是异步回帧，回复可能落在本轮排空之后；
+                // 实测 500 Hz 下约 0.2% 的拍会缺，且越靠后的电机 ID 越容易缺）⇒ 只打
+                // DEBUG。只有在连续缺失到 feedback_timeout_cycles_ 时才会 WARN/ERROR。
+                RCLCPP_DEBUG(get_node()->get_logger(), "Motor %u 本拍无反馈", id);
+            }
         }
     }
 
+    // ── 反馈健康度 → 锁存成「CSP 保持最后一帧位置」─────────────────────
+    // 不做自动恢复：一旦不信任这条通道，就让模块自己抱住，直到重启驱动。
+    size_t hold_count = 0;
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (motor_hold_latched_[i]) {
+            ++hold_count;
+            continue;
+        }
+        if (motor_unhealthy_count_[i] >= feedback_timeout_cycles_) {
+            latchMotorToCspHold(i, "feedback timeout");
+            ++hold_count;
+        }
+    }
+    if (!motor_ids_.empty() && hold_count == motor_ids_.size()) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "全部 %zu 个电机反馈均不可用 → 上报硬件错误（控制器将被停掉；"
+                     "各轴已本地锁存 CSP 保持请求，未确认电机执行）",
+                     motor_ids_.size());
+        return false;
+    }
+
     return true;
+}
+
+void JxHardware::latchMotorToCspHold(size_t index, const char* reason) {
+    // ⚠️ 调用方必须已持有 state_mutex_（readMotorStates() 内部调用）。
+    if (index >= motor_hold_latched_.size() || motor_hold_latched_[index]) {
+        return;
+    }
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Motor %u: %s; locally latched CSP hold request @ %.4f rad "
+                 "(command delivery and motor mode not confirmed)",
+                 motor_ids_[index], reason, joint_positions_[index]);
+    motor_hold_latched_[index] = 1;
+    // 锁存 = 改用模块自己的 CSP 位置环抱住当前位置（所以模式就是 CSP）。
+    // ⚠️ 这个改写**不恢复**：锁存只在 on_init 清，而 on_activate **不清**它 —— “这条通道
+    //    不可信”不会因为一次重新激活就变可信（清掉只会让该轴静默变成 CSP 轴）。
+    motor_control_modes_[index] = ControlMode::CSP_POSITION;
+    // 目标 = 最后已知位置，且 last_sent 与之一致 ⇒ CSP 追赶逻辑的 remaining 为 0，
+    // 它会原地不动地抱住这个位置。
+    latched_hold_positions_[index] = angleToInt16(joint_positions_[index] * 180.0 / M_PI);
+    resetPositionTarget(index);
+    // Keep the prior current history; latching does not make physical current zero.
+}
+
+// Caller holds state_mutex_, or owns the inactive hardware during activation.
+void JxHardware::resetPositionTarget(size_t index) {
+    const int16_t target = motor_hold_latched_[index] ? latched_hold_positions_[index]
+        : angleToInt16(joint_positions_[index] * 180.0 / M_PI);
+    raw_position_commands_[index] = target;
+    target_raw_position_commands_[index] = target;
+    last_sent_raw_commands_[index] = target;
+    last_sent_deltas_[index] = 0;
 }
 
 // === 新协议适配 START: 解析并发布新版16bit错误码 ===
@@ -1178,29 +1869,32 @@ void JxHardware::parseAndReportEmergencyFrame(uint8_t motor_id, const canfd_fram
 }
 
 // === 控制线程：周期性发送多控帧 ===
+// 节奏由 control_period_ms_ 决定（xacro 里配 2 ms = 500 Hz），**与 CM 的 update_rate 无关**。
 void JxHardware::controlLoop() {
     RCLCPP_INFO(get_node()->get_logger(), "Control thread started (period: %.2f ms)", control_period_ms_);
     auto period = std::chrono::microseconds(static_cast<int>(control_period_ms_ * 1000));
     auto next_time = std::chrono::steady_clock::now() + period;
 
     while (running_) {
-        sendMultiMotorCommand();
-        
+        // Failure is latched inside sendMultiMotorCommand and surfaced by read/write.
+        // Keep attempting CSP hold until lifecycle shutdown joins this thread.
+        (void)sendMultiMotorCommand();
+
         // 精确睡眠到下一个时间点
         std::this_thread::sleep_until(next_time);
         next_time += period;
-        
+
         // 防止累积误差
-        auto now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         if (next_time < now) {
             // 如果落后了，调整到下个周期
             next_time = now + period;
+        }
     }
-}
     RCLCPP_INFO(get_node()->get_logger(), "Control thread stopped");
+}
 
 } // namespace juxie_ros2_control
 
 // 导出插件
 PLUGINLIB_EXPORT_CLASS(juxie_ros2_control::JxHardware, hardware_interface::SystemInterface)
-}
