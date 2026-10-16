@@ -137,7 +137,7 @@ private:
     //   弹簧、会下沉几度（2026-10-13 真机实测）。把模型放进驱动是唯一不依赖上层的位置。
     // 数据：τ_g(body_joint1~3) 在 (q1,q2,q3) 网格上的 mA 值，手臂/头部固定在标称姿态
     //   （实测该近似最坏 0.86°；忽略 q4 最坏 0.86°；13³ 网格插值 0.32°）。
-    //   由 scripts/gen_waist_gravity_table.py 离线生成。
+    //   由 scripts/identify_juxie_friction_gravity.py table 离线生成。
     // 用法：每个控制周期从**实测**腰部角度三线性插值，加到 gravity_feedforward_ma_ 上。
     //   路径留空 = 关闭（行为与从前完全一致）。
     std::string gravity_ff_table_path_;

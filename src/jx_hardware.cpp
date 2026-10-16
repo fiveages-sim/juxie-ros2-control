@@ -901,7 +901,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
     }
 
     // 打印当前姿态下的重力前馈插值值（**不依赖任何控制器**），便于与离线
-    // `scripts/gen_waist_gravity_table.py` 打印的「核对用」数字逐位对照。
+    // `scripts/identify_juxie_friction_gravity.py table` 打印的「核对用」数字逐位对照。
     if (gravity_ff_table_n_ >= 2) {
         std::vector<double> gtab;
         if (gravityFeedforwardFromTable(gtab)) {
@@ -940,7 +940,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         joint_velocity_commands_[i] = 0.0;
         raw_velocity_commands_[i] = 0;
     }
-    // q_d 已经 = 当前实测位置 ⇒ 第一帧 write() 里弹簧项为 0，上电时腰不会自己动。
+    // q_d 已经 = 当前实测位置 ⇒ 控制线程首次下发时弹簧项为 0，上电时腰不会自己动。
     // 电流斜率限制的**起点**取实测 Iq 反馈（模块此刻真的在输出的电流），而不是 0、也不是
     // 上一轮的残留值 ⇒ 即使配了 current_slew_rate_ma_s_，也是从“电机现在在输出多少”开始
     // 爬，不会先蹦到残留值。（12 字节反馈的 data[4..5] 就是 Iq，单位 mA。）
@@ -1068,9 +1068,10 @@ JxHardware::on_export_command_interfaces() {
                 std::make_shared<hardware_interface::CommandInterface>(
                     joint_name, hardware_interface::HW_IF_VELOCITY, &joint_velocity_commands_[i]));
         }
-        // 电流环模式：额外导出 velocity 命令口 —— 它是**速度参考 q̇_d**（供底层阻抗层用），
-        // 不是电机速度命令。**不要导出 effort**：否则 CtrlInterfaces 的 MIX 自动检测
-        // 会把整机切到 MIX 分支，反而改变了上层行为。
+        // 电流环模式：额外导出 velocity 命令口 —— 上层写的就是普通速度命令 q̇_d，
+        // 驱动内部不转发给电机速度环，而是和 position 口的 q_d 一起代进阻抗律算电流。
+        // **不要导出 effort**：否则 CtrlInterfaces 的 MIX 自动检测会把整机切到 MIX 分支，
+        // 反而改变了上层行为。
         if (motor_control_modes_[i] == ControlMode::CURRENT_TORQUE) {
             command_interfaces.push_back(
                 std::make_shared<hardware_interface::CommandInterface>(
@@ -1112,7 +1113,7 @@ hardware_interface::return_type JxHardware::write(
     // Validate the complete snapshot before publishing any of it.
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         if (motor_hold_latched_[i]) continue;
-        // 位置参考（CSP / 电流环）与速度参考（CSV / 电流环）都要是有限值。
+        // position 命令（CSP / 电流环）与 velocity 命令（CSV / 电流环）都要是有限值。
         const bool needs_velocity = motor_control_modes_[i] == ControlMode::CSV_VELOCITY ||
                                     motor_control_modes_[i] == ControlMode::CURRENT_TORQUE;
         if (!std::isfinite(joint_position_commands_[i]) ||
