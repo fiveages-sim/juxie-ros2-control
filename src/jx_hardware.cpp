@@ -623,6 +623,28 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         RCLCPP_ERROR(get_node()->get_logger(), "All gear_ratios must be finite and > 0");
         return hardware_interface::CallbackReturn::ERROR;
     }
+    // 非 CSP 关节的每个速度值都乘/除 gear：漏配不报错，只会静默偏 gear 倍。
+    if (std::any_of(motor_control_modes_.begin(), motor_control_modes_.end(),
+                    [](ControlMode mode) { return mode != ControlMode::CSP_POSITION; })) {
+        if (ratios.empty()) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "gear_ratios is required for CSV/CST joints: unset falls back to 1.0, "
+                         "so every velocity is off by the real ratio");
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        for (size_t i = 0; i < motor_control_modes_.size(); ++i) {
+            if (motor_control_modes_[i] != ControlMode::CSP_POSITION && gear_ratios_[i] == 1.0) {
+                RCLCPP_WARN(get_node()->get_logger(),
+                            "gear_ratios is 1.0 for motor %u (uncalibrated?): its CSV/CST "
+                            "velocities will be off by the real ratio", motor_ids_[i]);
+            }
+        }
+        if (info_.hardware_parameters.find("max_velocity_rpm") == info_.hardware_parameters.end()) {
+            RCLCPP_WARN(get_node()->get_logger(),
+                        "max_velocity_rpm is unset; CSV speed falls back to %d rpm (full int16 "
+                        "range) with no other limiter in the driver", max_velocity_rpm_);
+        }
+    }
 
     // 初始化数据存储
     size_t motor_count = motor_ids_.size();
