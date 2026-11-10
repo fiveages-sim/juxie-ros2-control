@@ -559,8 +559,8 @@ bool JxHardware::readMotorStates(bool strict_check) {
 
                 int16_t raw_current = (frame.data[4] << 8) | frame.data[5];
                 joint_efforts_[i] = static_cast<double>(raw_current); // 新协议反馈Iq电流，单位mA
-
-                uint16_t error_code = frame.data[6] | (static_cast<uint16_t>(frame.data[7]) << 8);
+                uint16_t error_code =(static_cast<uint16_t>(frame.data[6]) << 8) | frame.data[7];
+                // uint16_t error_code = frame.data[6] | (static_cast<uint16_t>(frame.data[7]) << 8);
                 uint8_t mode_feedback = frame.data[10];
                 uint8_t status_byte = frame.data[11];
                 bool enable = (status_byte & 0x80) != 0;
