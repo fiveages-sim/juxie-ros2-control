@@ -1,6 +1,8 @@
 #include "juxie_ros2_control/jx_hardware.h"
+#include "juxie_ros2_control/friction_feedforward.h"
 #include <pluginlib/class_list_macros.hpp>
 #include <algorithm>
+#include <limits>
 #include <sstream>
 #include <thread>
 #include <chrono>
@@ -13,6 +15,19 @@
 #include <poll.h>
 
 namespace juxie_ros2_control {
+
+// ── /juxie_impedance_debug 的字段布局 ────────────────────────────────────────
+// 每个电机占 kDbgFieldsPerMotor 个 double，按 motor_ids_ 顺序拼接：
+//   [0] q_d  [1] q  [2] v_d  [3] v          （rad / rad·s⁻¹）
+//   [4] Kp·(q_d−q)  [5] Kd·(v_d−v)         （mA）
+//   [6] 重力（常数+表/话题+动态）  [7] 摩擦前馈  [8] friction_offset_ma
+//   [9] 最终下发电流（已限幅/限斜率）  [10] 实测 Iq 反馈
+//   [11] 查表值  [12] 话题值（话题不新鲜时为 NaN）
+//   [13] topic_weight（0=纯查表，1=纯话题）  [14] 话题新鲜标志 0/1
+// 为什么需要 11~14：重前馈有两层——话题（含真实手臂姿态）和查表（标称姿态）。
+// 话题超时会**静默**退回查表，而两者可差几百 mA。2026-11-05 分体模式下重力
+// 偏差从 +17 mA 跳到 −100 mA，到底是模型不准还是话题没接上，只能靠这几项分开。
+constexpr size_t kDbgFieldsPerMotor = 15;
 
 JxHardware::~JxHardware() {
     if (can_socket_ >= 0) on_deactivate(rclcpp_lifecycle::State{});
@@ -381,6 +396,12 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     apply_mode_override(current_ids, ControlMode::CURRENT_TORQUE);
     waist_current_interlock_enabled_ = false;
     waist_current_fault_ = false;
+    // ident 是**每个会话一次性**的标定动作，不能跨激活保留：重新 activate 时
+    // 若还带着上回的 RAMP，会立刻以一个未知的 ramp 值驱动某个轴。
+    ident_phase_ = IdentPhase::IDLE;
+    ident_ramp_ma_ = 0.0;
+    ident_elapsed_s_ = 0.0;
+    ident_sign_ = 0;
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         if (isWaistMotor(i) && motor_control_modes_[i] == ControlMode::CURRENT_TORQUE)
             waist_current_interlock_enabled_ = true;
@@ -438,6 +459,60 @@ hardware_interface::CallbackReturn JxHardware::on_init(
                      feedback_timeout_cycles_);
         return hardware_interface::CallbackReturn::ERROR;
     }
+    // 腰部故障时是否下发“失能 + 抱闸”。欠压/断电时 CSP 位置环同样出不了力，
+    // 只有抱闸（失电抱死，不依赖母线电流）能托住重力。
+    brake_on_waist_fault_ = get_param("brake_on_waist_fault", "true") != "false";
+    // 故障抱闸持续时长：on_deactivate 里每 10 ms 发一帧抱闸字，发这么久再关 CAN。
+    // 抱闸线圈失电 + 机械咬合要几十 ms；3 帧（30 ms）太短，驱动器在故障态下
+    // 丢掉前几帧就永远合不上。
+    brake_hold_ms_ = std::stoi(get_param("brake_hold_ms", "500"));
+    if (brake_hold_ms_ < 30 || brake_hold_ms_ > 5000) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'brake_hold_ms' must be in [30,5000], got %d",
+                     brake_hold_ms_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+
+    // ── 起动电流辨识（ident）参数，默认全关 ────────────────────────────────
+    // ⚠️ xacro 把 YAML 里的 Python bool 渲染成 "True"/"False"（首字母大写），
+    //    所以不能拿 != "false" 判断 —— 大小写无关地解析。
+    const auto parse_ident_bool = [&](const char* name, bool fallback) {
+        std::string raw = get_param(name, fallback ? "true" : "false");
+        std::transform(raw.begin(), raw.end(), raw.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return !(raw == "false" || raw == "0" || raw == "no" || raw == "off" || raw.empty());
+    };
+    ident_enable_ = parse_ident_bool("ident_enable", false);
+    ident_max_ma_ = std::stod(get_param("ident_max_ma", "3000"));
+    ident_ramp_ma_s_ = std::stod(get_param("ident_ramp_ma_s", "200"));
+    const double ident_move_deg = std::stod(get_param("ident_move_deg", "0.02"));
+    ident_move_rad_ = ident_move_deg * M_PI / 180.0;
+    ident_timeout_s_ = std::stod(get_param("ident_timeout_s", "5.0"));
+    if (ident_max_ma_ <= 0.0 || ident_max_ma_ > max_current_ma_ ||
+        ident_ramp_ma_s_ <= 0.0 || ident_move_rad_ <= 0.0 || ident_timeout_s_ <= 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "ident 参数非法：ident_max_ma 必须在 (0, max_current_ma=%d]，"
+                     "ident_ramp_ma_s / ident_move_deg / ident_timeout_s 必须 > 0"
+                     "（当前 %g / %g / %g s）",
+                     max_current_ma_, ident_max_ma_, ident_move_deg, ident_timeout_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    if (ident_enable_) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "起动电流辨识已启用：/body_ident_command=[motor_id,±1] → ramp 到 "
+                    "%.0f mA / %.0f mA·s⁻¹，动 %.3f° 即停；超时 %.1f s。"
+                    "⚠️ 该轴在 ident 期间会短时失去 Kp/Kd 与摩擦前馈（只保留重力前馈）",
+                    ident_max_ma_, ident_ramp_ma_s_, ident_move_deg, ident_timeout_s_);
+    }
+
+    // ── 逐项分解调试通道 ────────────────────────────────────────────────────
+    // 默认开（一个话题、没人订阅零开销），因为它只读不写，不会影响控制，
+    // 而全身模式下这是**唯一**能看到 q_d 的途径。
+    impedance_debug_decim_ = std::stoi(get_param("impedance_debug_decim", "5"));
+    if (impedance_debug_decim_ < 1) impedance_debug_decim_ = 1;
+    impedance_debug_pub_ = get_node()->create_publisher<std_msgs::msg::Float64MultiArray>(
+        get_param("impedance_debug_topic", "/juxie_impedance_debug"),
+        rclcpp::QoS(50));
 
     // ── 底层阻抗层参数（单位全部是 mA；1 个值 = 全部电机同值）──────────────────
     const auto parse_gain_list = [&](const char* param_name, std::vector<double>& out,
@@ -475,6 +550,14 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     parse_gain_list("friction_viscous_ma_s_rad", friction_viscous_ma_s_rad_, false);
     parse_gain_list("friction_offset_ma", friction_offset_ma_, true);
     parse_gain_list("gravity_feedforward_ma", gravity_feedforward_ma_, true);
+    parse_gain_list("friction_stiction_ma", friction_stiction_ma_, false);
+    stribeck_vel_rad_s_ = std::stod(get_param("stribeck_vel_rad_s", "0"));
+    if (!std::isfinite(stribeck_vel_rad_s_) || stribeck_vel_rad_s_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'stribeck_vel_rad_s' must be finite and >= 0 (0 = off), got %g",
+                     stribeck_vel_rad_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
     friction_vel_eps_rad_s_ = std::stod(get_param("friction_vel_eps_rad_s", "0.002"));
     if (!std::isfinite(friction_vel_eps_rad_s_) || friction_vel_eps_rad_s_ < 0.0) {
         RCLCPP_ERROR(get_node()->get_logger(),
@@ -483,20 +566,70 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         return hardware_interface::CallbackReturn::ERROR;
     }
     // 摩擦前馈取哪个速度 + 幅值上限（不配 = 老行为：实测速度、不限幅）。
+    //   measured        = 只用实测速度（死区内为 0）
+    //   reference       = 滑起来后用参考速度换向抢先（原有行为）
+    //   reference_ramp  = 在 reference 基础上，再在死区内按 |q̇_d|/死区 比例补
+    //                     （修低速升降粘滑；2026-10-28 新增，默认不启用）
     const std::string ff_velocity = get_param("friction_ff_velocity", "measured");
-    if (ff_velocity != "measured" && ff_velocity != "reference") {
+    if (ff_velocity != "measured" && ff_velocity != "reference" &&
+        ff_velocity != "reference_ramp") {
         RCLCPP_ERROR(get_node()->get_logger(),
-                     "Parameter 'friction_ff_velocity' must be 'measured' or 'reference', got '%s'",
+                     "Parameter 'friction_ff_velocity' must be 'measured', 'reference' "
+                     "or 'reference_ramp', got '%s'",
                      ff_velocity.c_str());
         return hardware_interface::CallbackReturn::ERROR;
     }
-    friction_ff_use_reference_vel_ = (ff_velocity == "reference");
+    friction_ff_use_reference_vel_ = (ff_velocity != "measured");
+    friction_ff_fill_deadband_ = (ff_velocity == "reference_ramp");
+    // 死区内补摩擦的斜坡宽度：死区 vel_eps 是“用哪个速度判方向”的门槛，本参数是
+    // “补多少”的门槛。低速升降时末端速度一样、各轴关节速度差好几倍（z 6 mm/s ⇒
+    // j1 0.009 / j2 0.019 rad/s），共用一个门槛会让三轴补不齐 ⇒ 姿态前后摆。
+    // 0 = 沿用 vel_eps（与旧行为逐字节一致）。
+    friction_ff_ramp_vel_rad_s_ = std::stod(get_param("friction_ff_ramp_vel_rad_s", "0"));
+    if (!std::isfinite(friction_ff_ramp_vel_rad_s_) || friction_ff_ramp_vel_rad_s_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_ff_ramp_vel_rad_s' must be finite and >= 0, got %g",
+                     friction_ff_ramp_vel_rad_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    if (friction_ff_ramp_vel_rad_s_ > 0.0 && !friction_ff_fill_deadband_) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "'friction_ff_ramp_vel_rad_s' has no effect unless "
+                    "friction_ff_velocity=reference_ramp (current: %s)",
+                    ff_velocity.c_str());
+    }
     friction_ff_max_ma_ = std::stod(get_param("friction_ff_max_ma", "0"));
     if (!std::isfinite(friction_ff_max_ma_) || friction_ff_max_ma_ < 0.0) {
         RCLCPP_ERROR(get_node()->get_logger(),
                      "Parameter 'friction_ff_max_ma' must be finite and >= 0 (0 = unlimited), got %g",
                      friction_ff_max_ma_);
         return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 参考速度低通 + 噪声死区（0 = 关闭，与旧行为一致）。见 jx_hardware.h 注释。
+    friction_ff_vd_filter_hz_ = std::stod(get_param("friction_ff_vd_filter_hz", "0"));
+    if (!std::isfinite(friction_ff_vd_filter_hz_) || friction_ff_vd_filter_hz_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_ff_vd_filter_hz' must be finite and >= 0 "
+                     "(0 = no filter), got %g", friction_ff_vd_filter_hz_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    friction_ff_min_vel_rad_s_ = std::stod(get_param("friction_ff_min_vel_rad_s", "0"));
+    if (!std::isfinite(friction_ff_min_vel_rad_s_) || friction_ff_min_vel_rad_s_ < 0.0) {
+        RCLCPP_ERROR(get_node()->get_logger(),
+                     "Parameter 'friction_ff_min_vel_rad_s' must be finite and >= 0 "
+                     "(0 = no deadband), got %g", friction_ff_min_vel_rad_s_);
+        return hardware_interface::CallbackReturn::ERROR;
+    }
+    ff_vd_filt_.assign(motor_ids_.size(), 0.0);
+    if (friction_ff_min_vel_rad_s_ > 0.0 && !friction_ff_fill_deadband_) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "'friction_ff_min_vel_rad_s' only applies to the reference_ramp "
+                    "branch (current: %s)", ff_velocity.c_str());
+    }
+    if (friction_ff_vd_filter_hz_ > 0.0) {
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "friction FF reference velocity LPF = %.2f Hz, noise deadband = %.4f rad/s",
+                    friction_ff_vd_filter_hz_, friction_ff_min_vel_rad_s_);
     }
     // 电流环必须加载有效的重力表；CSP/CSV 可不配置。
     // 它是**无控制器时唯一能把腰顶住**的东西：手臂出错 ⇒ WBC 激活不了 ⇒ 没人发位置参考、
@@ -579,6 +712,52 @@ hardware_interface::CallbackReturn JxHardware::on_init(
                     "Waist gravity FF topic: %s (fresh <= %.2f s) —— 新鲜时优先于查表",
                     gravity_ff_topic_.c_str(), gravity_ff_topic_timeout_s_);
     }
+
+    // ── 起动电流辨识：命令/结果话题（ident_enable=false 时不建，零开销）─────────
+    if (ident_enable_) {
+        ident_result_pub_ = get_node()->create_publisher<std_msgs::msg::Float64MultiArray>(
+            "/body_ident_result", rclcpp::QoS(10));
+        ident_cmd_sub_ = get_node()->create_subscription<std_msgs::msg::Int32MultiArray>(
+            "/body_ident_command", rclcpp::QoS(10),
+            [this](const std_msgs::msg::Int32MultiArray::SharedPtr msg) {
+                if (!msg || msg->data.size() < 2) {
+                    RCLCPP_WARN(get_node()->get_logger(),
+                                "ident 命令格式：[motor_id, ±1]");
+                    return;
+                }
+                const int motor_id = msg->data[0];
+                const int sign = msg->data[1] >= 0 ? 1 : -1;
+                size_t index = motor_ids_.size();
+                for (size_t i = 0; i < motor_ids_.size(); ++i) {
+                    if (static_cast<int>(motor_ids_[i]) == motor_id) { index = i; break; }
+                }
+                if (index == motor_ids_.size()) {
+                    RCLCPP_WARN(get_node()->get_logger(), "ident：没有电机 ID %d", motor_id);
+                    return;
+                }
+                if (!running_ || motor_control_modes_[index] != ControlMode::CURRENT_TORQUE) {
+                    RCLCPP_WARN(get_node()->get_logger(),
+                                "ident：电机 %d 不在电流环或驱动未运行，拒绝", motor_id);
+                    return;
+                }
+                if (ident_phase_ != IdentPhase::IDLE) {
+                    RCLCPP_WARN(get_node()->get_logger(),
+                                "ident：电机 %u 正在辨识，等它结束", motor_ids_[ident_motor_index_]);
+                    return;
+                }
+                if (motor_hold_latched_[index] || brake_engage_requested_[index]) {
+                    RCLCPP_WARN(get_node()->get_logger(),
+                                "ident：电机 %d 处于故障锁存/抱闸，拒绝", motor_id);
+                    return;
+                }
+                startIdent(index, sign);
+            });
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "ident 就绪：/body_ident_command=[motor_id,±1] → /body_ident_result="
+                    "[motor_id, sign, breakaway_ma, delta_deg, status]"
+                    " (status 1=动到了 0=到限/超时 -1=中止)");
+    }
+
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
             continue;
@@ -586,13 +765,18 @@ hardware_interface::CallbackReturn JxHardware::on_init(
         RCLCPP_INFO(get_node()->get_logger(),
                     "Motor %u impedance layer: Kp=%.1f mA/rad, Kd=%.1f mA*s/rad, "
                     "Coulomb=%.0f mA, viscous=%.0f mA*s/rad, offset=%.0f mA, gravity=%.0f mA, "
-                    "v_eps=%.4f rad/s, limit=+/-%d mA, slew=%.0f mA/s, ff_vel=%s, ff_max=%.0f mA",
+                    "v_eps=%.4f rad/s, limit=+/-%d mA, slew=%.0f mA/s, ff_vel=%s, ff_max=%.0f mA, "
+                    "stiction=%.0f mA, v_stribeck=%.4f rad/s, ff_ramp_vel=%.4f rad/s",
                     motor_ids_[i], impedance_kp_ma_rad_[i], impedance_kd_ma_s_rad_[i],
                     friction_coulomb_ma_[i], friction_viscous_ma_s_rad_[i],
                     friction_offset_ma_[i], gravity_feedforward_ma_[i],
                     friction_vel_eps_rad_s_, max_current_ma_, current_slew_rate_ma_s_,
-                    friction_ff_use_reference_vel_ ? "reference" : "measured",
-                    friction_ff_max_ma_);
+                    friction_ff_use_reference_vel_
+                        ? (friction_ff_fill_deadband_ ? "reference_ramp" : "reference")
+                        : "measured",
+                    friction_ff_max_ma_, friction_stiction_ma_[i], stribeck_vel_rad_s_,
+                    friction_ff_ramp_vel_rad_s_ > 0.0 ? friction_ff_ramp_vel_rad_s_
+                                                     : friction_vel_eps_rad_s_);
     }
 
     gear_ratios_.assign(motor_ids_.size(), 1.0);
@@ -668,6 +852,7 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     motor_unhealthy_count_.assign(motor_count, 0);
     motor_ready_.assign(motor_count, false);
     motor_hold_latched_.assign(motor_count, 0);   // 锁存只在这里（真正重新初始化）清
+    brake_engage_requested_.assign(motor_count, 0);
 
     running_ = false;
     is_first_command_ = true;
@@ -677,6 +862,12 @@ hardware_interface::CallbackReturn JxHardware::on_init(
     RCLCPP_INFO(get_node()->get_logger(), "  CAN Interface: %s", can_interface_.c_str());
     RCLCPP_INFO(get_node()->get_logger(), "  Control Period: %.2f ms", control_period_ms_);
     RCLCPP_INFO(get_node()->get_logger(), "  Control Mode: %s", controlModeName());
+    RCLCPP_INFO(get_node()->get_logger(), "  Fault brake: %s",
+                brake_on_waist_fault_
+                    ? "waist fault -> disable + brake (0x26) + clear-error"
+                    : "waist fault -> CSP request only");
+    RCLCPP_INFO(get_node()->get_logger(),
+                "  Fault brake hold window: %d ms (frames every 10 ms)", brake_hold_ms_);
     if (hasVelocityControl()) {
         RCLCPP_INFO(get_node()->get_logger(), "  Max velocity: %d motor RPM", max_velocity_rpm_);
     }
@@ -928,6 +1119,12 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
                      "Waist group fault is latched; reinitialize hardware before reactivation");
         return hardware_interface::CallbackReturn::ERROR;
     }
+    // ident 不能跨激活保留：上一次（可能被 Ctrl-C 打断的）ramp 不能带进这一次，
+    // 否则重新激活的第一帧就会用一个来历不明的电流驱动某个轴。
+    ident_phase_ = IdentPhase::IDLE;
+    ident_ramp_ma_ = 0.0;
+    ident_elapsed_s_ = 0.0;
+    ident_sign_ = 0;
     // Recheck before touching CAN: the table may have disappeared since on_init().
     if (hasCurrentControl() && !loadGravityFfTable(gravity_ff_table_path_)) {
         RCLCPP_ERROR(get_node()->get_logger(),
@@ -957,11 +1154,51 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
 
     // 发送同步帧→获取初始状态（仅初始化时发送一次）
     sendSyncFrame();
-    if (!readMotorStates(true)) { 
+    // 第一次严格读只取反馈：冷启动时模块通常还处于“未使能 + 抱闸合上”状态，
+    // 而腰部联锁要求“已使能 + 已松闸”才能进电流环 —— 先读，再自己把它使能起来。
+    if (!readMotorStates(true, /*enforce_waist_interlock=*/false)) {
         RCLCPP_ERROR(get_node()->get_logger(), "Incomplete motor state initialization");
         ::close(can_socket_);
         can_socket_ = -1;
         return hardware_interface::CallbackReturn::ERROR;
+    }
+    // 冷启动使能：CSP 保持到实测位置 → 松闸 → 再切电流环。
+    // 不这么做的话，上电第一次 bringup 会直接被联锁拒绝（Motor N is not enabled）。
+    if (waist_current_interlock_enabled_ && !waistGroupReady()) {
+        RCLCPP_WARN(get_node()->get_logger(),
+                    "腰轴未使能或抱闸未释放（冷启动常见）：先发 CSP 保持帧使能，目标=实测位置");
+        if (!enableWaistInCspHold()) {
+            RCLCPP_ERROR(get_node()->get_logger(), "腰轴使能帧发送失败（CAN）");
+            ::close(can_socket_);
+            can_socket_ = -1;
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        {
+            // “未使能”也会累加健康计数；清零后重新计，避免使能期间就被判成反馈超时锁存。
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            for (size_t i = 0; i < motor_ids_.size(); ++i) {
+                if (isWaistMotor(i)) {
+                    motor_unhealthy_count_[i] = 0;
+                }
+            }
+        }
+        bool ready = false;
+        for (int attempt = 0; attempt < 10 && !ready; ++attempt) {
+            (void)readMotorStates(false, /*enforce_waist_interlock=*/false);
+            ready = waistGroupReady();
+            if (!ready) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        if (!ready) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "腰轴仍未使能/松闸（反馈未给出 enabled + brake released），"
+                         "拒绝进入电流环；电机保持 CSP 位置保持，查电机供电与抱闸回路");
+            ::close(can_socket_);
+            can_socket_ = -1;
+            return hardware_interface::CallbackReturn::ERROR;
+        }
+        RCLCPP_INFO(get_node()->get_logger(), "腰轴已使能并松闸，开始电流环");
     }
 
     // 打印当前姿态下的重力前馈插值值（**不依赖任何控制器**），便于与离线
@@ -1001,6 +1238,7 @@ hardware_interface::CallbackReturn JxHardware::on_activate(
         resetPositionTarget(i);
         position_reference_[i] = joint_positions_[i];
         velocity_reference_[i] = 0.0;
+        if (i < ff_vd_filt_.size()) ff_vd_filt_[i] = 0.0;  // 摩擦前馈低通重新起滤
         joint_velocity_commands_[i] = 0.0;
         raw_velocity_commands_[i] = 0;
     }
@@ -1052,20 +1290,42 @@ hardware_interface::CallbackReturn JxHardware::on_deactivate(
                 resetPositionTarget(i);
             }
         }
+        // 故障抱闸的轴不会再被使能：packing 阶段会用 CTRL_WORD_BRAKE_ENGAGE 覆盖控制字。
+        size_t brake_axes = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            for (const char engaged : brake_engage_requested_) {
+                brake_axes += engaged ? 1 : 0;
+            }
+        }
+        if (brake_axes > 0) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "%zu 个轴处于故障抱闸状态：下面发的是“失能+抱闸”(0x%02X)，"
+                         "持续 %d ms（不是 CSP 保持）",
+                         brake_axes, CTRL_WORD_BRAKE_ENGAGE_CLEAR, brake_hold_ms_);
+        }
         // Mode changes are asynchronous; send multiple frames and check that at least one was sent.
+        // 故障抱闸时多留一段时间：抱闸线圈失电 + 机械咬合需要几十 ms，
+        // 只发 3 帧容易被驱动器在故障态下整段丢掉。
         // Protect shared mode and target state; sendMultiMotorCommand() acquires the mutex itself.
         int sent_ok = 0;
-        for (int k = 0; k < 3; ++k) {
+        const int frames = std::max(3, brake_hold_ms_ / 10);
+        for (int k = 0; k < frames; ++k) {
             if (sendMultiMotorCommand()) {
                 ++sent_ok;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        if (brake_axes > 0 && sent_ok > 0) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "故障抱闸：%d 帧已发出（%d ms 窗口），随后关闭 CAN",
+                         sent_ok, brake_hold_ms_);
+        }
         if (sent_ok == 0) {
             csp_switch_send_failed = true;
             RCLCPP_ERROR(get_node()->get_logger(),
-                         "切回 CSP 的 3 帧**全部提交失败**（CAN 写失败）⇒ 不保证电机已进入"
-                         "位置保持。");
+                         "关机帧**全部提交失败**（CAN 写失败）⇒ 不保证电机已进入"
+                         "位置保持 / 抱闸。");
         }
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1339,12 +1599,16 @@ bool JxHardware::sendMultiMotorCommand() {
     // ── 底层阻抗层：把上层的（位置, 速度）参考换成电流（mA）────────────────────
     //   I = Kp·(q_d − q) + Kd·(q̇_d − q̇) + g_ff + f_off + FF
     // 上层（OCS2/WBC）照旧只发位置/速度，换算在这里（每个 write() 一次 = CM update_rate）。
-    //   FF = 0                                         当 |v_ff| < v_eps
-    //      = sign(v_ff)·min(f_c + f_v·|v_ff|, ff_max)   否则
+    //   FF = 0                                         当 |v_ff| < v_eps 且指令不动
+    //      = sign·min(f_c + f_v·|v|, ff_max)           滑起来后（|v_ff| ≥ v_eps）
+    //      = sign(q̇_d)·(|q̇_d|/v_eps)·min(...)         指令在动但关节还卡着（见
+    //                                                  friction_feedforward.h）
     //   v_ff：默认取**实测速度**；friction_ff_velocity=reference 时，|q̇_d| >= v_eps
     //         就改用**参考速度**（换向时抢先一步，真机跟踪误差实测好 2.4×），
     //         否则仍退回实测速度（被外力推动时前馈不会归零）。
-    // 速度死区避免静止时的 1 rpm 量化噪声造成“正反馈自激”式抖动。
+    // 速度死区避免静止时的 1 rpm 量化噪声造成“正反馈自激”式抖动；但**不能**在低速
+    // 升降时把前馈整段关掉：|q̇_d| ≈ 0.02 < 0.03 会让误差爬到 f_c/Kp 再突然滑动，
+    // 表现为 ~2.5 s 周期的粘滑锯齿（腰部升降前后摆 1~2°，实测 2026-10-28）。
     // 腰部重力前馈，两层（**取其一，不叠加**）：
     //   ① 控制器活着 → 话题值（含真实手臂姿态，精确）
     //   ② 否则       → 驱动自己的查表（标称手臂姿态；不依赖任何控制器，保命）
@@ -1365,6 +1629,12 @@ bool JxHardware::sendMultiMotorCommand() {
     // Without a table there is no baseline to blend from; retain immediate topic use.
     const double topic_weight = gravity_ff_transition_.topicWeight(
         has_gravity_topic, now_s, has_gravity_table ? gravity_ff_transition_s_ : 0.0);
+    // 逐项分解的中转缓冲（只有真的有人订阅时才填，否则零开销）。
+    std::vector<double> dbg;
+    if (impedance_debug_pub_ && impedance_debug_pub_->get_subscription_count() > 0) {
+        dbg.assign(motor_ids_.size() * kDbgFieldsPerMotor,
+                   std::numeric_limits<double>::quiet_NaN());
+    }
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         if (motor_control_modes_[i] != ControlMode::CURRENT_TORQUE) {
             continue;
@@ -1374,26 +1644,77 @@ bool JxHardware::sendMultiMotorCommand() {
         const double q_d = position_reference_[i];
         const double v = joint_velocities_[i];
         const double v_d = velocity_reference_[i];
+        // 摩擦前馈用的参考速度：先一阶低通，压掉 WBC 在 0 附近的高频抖动。
+        // 不滤的话 |v_d| 的噪声（±0.01 rad/s）远超 ramp 宽度（0.0015），
+        // reference_ramp 分支一饱和就变成 ±f_s 满幅翻号（见 jx_hardware.h 注释）。
+        double v_d_ff = v_d;
+        if (friction_ff_vd_filter_hz_ > 0.0 && i < ff_vd_filt_.size()) {
+            const double dt_s = static_cast<double>(control_period_ms_) * 1e-3;
+            const double tau = 1.0 / (2.0 * M_PI * friction_ff_vd_filter_hz_);
+            const double alpha = dt_s / (tau + dt_s);   // 一阶低通系数
+            ff_vd_filt_[i] += alpha * (v_d - ff_vd_filt_[i]);
+            v_d_ff = ff_vd_filt_[i];
+        }
         const double table_i = has_gravity_table ? gravity_table_ma[i] : 0.0;
         const double topic_i = has_gravity_topic ? gravity_topic_ma[i] : table_i;
         const double gravity_auto_i = (1.0 - topic_weight) * table_i + topic_weight * topic_i;
         const double dynamic_i = i < dynamic_topic_ma.size() ? topic_weight * dynamic_topic_ma[i] : 0.0;
-        double current = impedance_kp_ma_rad_[i] * (q_d - q) +
-                         impedance_kd_ma_s_rad_[i] * (v_d - v) +
-                         gravity_feedforward_ma_[i] + gravity_auto_i + dynamic_i + friction_offset_ma_[i];
-        const double v_ff = (friction_ff_use_reference_vel_ &&
-                             std::abs(v_d) >= friction_vel_eps_rad_s_) ? v_d : v;
-        if (std::abs(v_ff) >= friction_vel_eps_rad_s_) {
-            const double sign_v = v_ff > 0.0 ? 1.0 : -1.0;
-            double friction_ff = friction_coulomb_ma_[i] +
-                                 friction_viscous_ma_s_rad_[i] * std::abs(v_ff);
-            if (friction_ff_max_ma_ > 0.0) {
-                friction_ff = std::min(friction_ff, friction_ff_max_ma_);
-            }
-            current += sign_v * friction_ff;
-        }
+        double term_kp = impedance_kp_ma_rad_[i] * (q_d - q);
+        double term_kd = impedance_kd_ma_s_rad_[i] * (v_d - v);
+        double term_gravity = gravity_feedforward_ma_[i] + gravity_auto_i + dynamic_i;
+        const double term_offset = friction_offset_ma_[i];
+        // 摩擦前馈：见 friction_feedforward.h —— 关键是「指令在动、关节还卡着」时
+        // 也要按 |q̇_d|/死区 比例补，否则低速升降会粘滑（误差爬到 f_c/Kp 才突然滑动）。
+        double term_ff = frictionFeedforwardMa(v, v_d_ff,
+                                               friction_coulomb_ma_[i],
+                                               friction_viscous_ma_s_rad_[i],
+                                               friction_vel_eps_rad_s_,
+                                               friction_ff_max_ma_,
+                                               friction_ff_use_reference_vel_,
+                                               friction_ff_fill_deadband_,
+                                               friction_stiction_ma_[i],
+                                               stribeck_vel_rad_s_,
+                                               friction_ff_ramp_vel_rad_s_,
+                                               friction_ff_min_vel_rad_s_);
+        double current = term_kp + term_kd + term_gravity + term_offset + term_ff;
         if (!std::isfinite(current)) {
             current = 0.0;
+        }
+        // ── 起动电流辨识：把这一轴的阻抗律整段换成「重力前馈 + 电流 ramp」────────
+        // 只替换被触发的那一个轴，其余轴照常跑阻抗（不会因辨识整机失去柔顺）。
+        // Kp / Kd / 摩擦前馈全部跳过，所以 ramp 要克服的只有纯摩擦 ⇒ 测出来
+        // 直接就是 f_s + f_off，不用再减重力，也不用相信 URDF 的零点。
+        if (ident_phase_ == IdentPhase::RAMP && i == ident_motor_index_) {
+            const double ident_gravity_ma =
+                gravity_feedforward_ma_[i] + gravity_auto_i + dynamic_i;
+            advanceIdent(i, static_cast<double>(control_period_ms_) * 1e-3,
+                         ident_gravity_ma);
+            if (ident_phase_ == IdentPhase::RAMP) {
+                current = ident_gravity_ma + ident_ramp_ma_;
+                // 调试通道要如实反映「这一拍到底什么都没补」
+                term_kp = 0.0;
+                term_kd = 0.0;
+                term_ff = 0.0;
+                term_gravity = ident_gravity_ma;
+            }
+        }
+        if (!dbg.empty()) {
+            double* row = &dbg[i * kDbgFieldsPerMotor];
+            row[0] = q_d;
+            row[1] = q;
+            row[2] = v_d;
+            row[3] = v;
+            row[4] = term_kp;
+            row[5] = term_kd;
+            row[6] = term_gravity;
+            row[7] = term_ff;
+            row[8] = term_offset;
+            // 11~14：重力前馈的两层到底用了哪一层
+            row[11] = table_i;
+            row[12] = has_gravity_topic ? topic_i
+                                        : std::numeric_limits<double>::quiet_NaN();
+            row[13] = topic_weight;
+            row[14] = has_gravity_topic ? 1.0 : 0.0;
         }
         raw_current_commands_[i] = static_cast<int16_t>(std::clamp(
             std::lround(current), -static_cast<long>(max_current_ma_),
@@ -1426,6 +1747,24 @@ bool JxHardware::sendMultiMotorCommand() {
             }
         }
     }
+
+    // 逐项分解调试通道：到这里 raw_current_commands_ 已经是最终（限幅/限斜率后）的值。
+    if (!dbg.empty() && impedance_debug_pub_) {
+        impedance_debug_counter_ = (impedance_debug_counter_ + 1) %
+            static_cast<uint32_t>(std::max(1, impedance_debug_decim_));
+        if (impedance_debug_counter_ == 0) {
+            for (size_t i = 0; i < motor_ids_.size(); ++i) {
+                double* row = &dbg[i * kDbgFieldsPerMotor];
+                row[9] = static_cast<double>(raw_current_commands_[i]);
+                row[10] = joint_efforts_[i];
+            }
+            std_msgs::msg::Float64MultiArray msg;
+            msg.data = std::move(dbg);
+            impedance_debug_pub_->publish(msg);
+            dbg.clear();
+        }
+    }
+
     // 填充每个电机的控制包（7字节/个，共8个）
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         const size_t pkg_offset = i * 7;
@@ -1453,6 +1792,16 @@ bool JxHardware::sendMultiMotorCommand() {
                     raw_command = raw_current_commands_[i];
                     break;
             }
+        }
+        if (i < brake_engage_requested_.size() && brake_engage_requested_[i]) {
+            // 故障抱闸：失能状态下模块不会执行位置/速度/电流目标，命令字段填 0。
+            // 7 字节模块的控制字由通道偏置决定、没有抱闸位，只能发 0x00。
+            // 其余模块发 **0x26**（抱闸 + 清错）：驱动器把欠压锁成故障态后，
+            // 不带清错位的控制字可能被直接丢弃，抱闸就永远不动作、重力把人送下去。
+            // enable / brake-release 位仍为 0，所以清错不会把电机重新使能。
+            control_byte = (locked_feedback_len_ == 7)
+                ? 0x00 : CTRL_WORD_BRAKE_ENGAGE_CLEAR;
+            raw_command = 0;
         }
         const uint16_t encoded = static_cast<uint16_t>(raw_command);
         data[pkg_offset + 0] = control_byte;
@@ -1516,7 +1865,7 @@ bool JxHardware::sendMultiMotorCommand() {
 }
 
 // === 读取电机状态（非阻塞读取+缓存所有反馈）+ 错误处理 ===
-bool JxHardware::readMotorStates(bool strict_check) {
+bool JxHardware::readMotorStates(bool strict_check, bool enforce_waist_interlock) {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
     // 创建临时映射表存储最新反馈
@@ -1550,10 +1899,28 @@ bool JxHardware::readMotorStates(bool strict_check) {
                 }
             } else if (frame.can_id >= 0x80 && frame.can_id < 0x80 + 256) {
                 uint8_t motor_id = frame.can_id - 0x80;
-                if (std::find(motor_ids_.begin(), motor_ids_.end(), motor_id) != motor_ids_.end()) {
+                const auto motor_it =
+                    std::find(motor_ids_.begin(), motor_ids_.end(), motor_id);
+                if (motor_it != motor_ids_.end()) {
                     parseAndReportEmergencyFrame(motor_id, frame);
-                    running_ = false;
-                    return false;
+                    const size_t index =
+                        static_cast<size_t>(std::distance(motor_ids_.begin(), motor_it));
+                    if (isWaistMotor(index)) {
+                        // 承重轴故障（欠压/过压/堵转…）：整组“失能 + 抱闸”。
+                        // ⚠️ 刻意**不**停发送线程 —— 停掉就等于一帧都不发，抱闸请求也发不出去。
+                        //    read() 仍返回 ERROR，CM 会在 ~1 个周期内走 deactivate。
+                        if (brake_on_waist_fault_ && running_) {
+                            tripWaistCurrentInterlock("motor emergency frame");
+                        }
+                        return false;
+                    }
+                    // 非承重轴（头部 motor 5/6）：**只锁这一轴，不要让 read() 失败**。
+                    // 否则 CM 会 deactivate 整个 juxie_body，腰跟着丢电流 + 抱闸，
+                    // 整个上身直接趴下 —— 实测 2026-11-02：头部 motor 5 报了一个
+                    // 自相矛盾的 0x0103（过压 + 欠压同时出现，多半是坏帧/坏编码器），
+                    // 把正在跑标定的腰部一起打死。
+                    latchOneMotorToCspHold(index, "motor emergency frame");
+                    continue;
                 }
             }
         }
@@ -1635,9 +2002,15 @@ bool JxHardware::readMotorStates(bool strict_check) {
         if (!error) {
             return true;
         }
-        // 只有腰部承重：腰部报错停发整帧（整组由联锁处理）；头部只锁存该轴。
+        // 只有腰部承重：报错就整组抱闸（抱闸不依赖母线电流，欠压时也能托住）。
+        // 头部不承重：只锁存该轴，继续发整帧。
         if (isWaistMotor(index)) {
-            running_ = false;
+            if (brake_on_waist_fault_ && running_) {
+                // 先置位抱闸控制字；发送线程保持运行，才能把抱闸帧真的发出去。
+                requestBrakeEngage(index, "motor error");
+            } else {
+                running_ = false;
+            }
             return false;
         }
         latchMotorToCspHold(index, "motor error");
@@ -1741,7 +2114,7 @@ bool JxHardware::readMotorStates(bool strict_check) {
         }
     }
 
-    if (waist_current_interlock_enabled_) {
+    if (waist_current_interlock_enabled_ && enforce_waist_interlock) {
         for (size_t i = 0; i < motor_ids_.size(); ++i) {
             if (!isWaistMotor(i)) continue;
             // 只在这里判“本拍就已确定不可用”的条件。反馈丢失由下面的连续超时判定，
@@ -1790,11 +2163,156 @@ bool JxHardware::isWaistMotor(size_t index) const {
     return index < motor_ids_.size() && motor_ids_[index] >= 1 && motor_ids_[index] <= 4;
 }
 
+bool JxHardware::waistGroupReady() {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (!waist_current_interlock_enabled_) {
+        return true;
+    }
+    for (size_t i = 0; i < motor_ids_.size(); ++i) {
+        if (isWaistMotor(i) && (!motor_ready_[i] || motor_hold_latched_[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool JxHardware::enableWaistInCspHold() {
+    // 冷启动：模块上电后默认“未使能 + 抱闸合上”。电流环（0x05）本身没有位置环，
+    // 所以先用 CSP 帧（使能 + 松闸 + 清故障）把它拉起来，目标 = 实测位置。
+    std::vector<ControlMode> saved_modes;
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        saved_modes = motor_control_modes_;
+        for (size_t i = 0; i < motor_control_modes_.size(); ++i) {
+            if (isWaistMotor(i)) {
+                motor_control_modes_[i] = ControlMode::CSP_POSITION;
+            }
+            resetPositionTarget(i);  // 所有 CSP 轴都从实测位置起步，避免首帧跳变
+        }
+        is_first_command_ = true;    // 首帧带 clear-error 位
+    }
+    bool sent = true;
+    for (int k = 0; k < 5; ++k) {
+        if (!sendMultiMotorCommand()) {
+            sent = false;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        motor_control_modes_ = saved_modes;
+    }
+    return sent;
+}
+
+namespace {
+enum class IdentAction { kRamp, kLatch, kHitLimit, kTimeout };
+
+struct IdentLimits {
+    double max_ma;
+    double ramp_ma_s;
+    double move_rad;
+    double timeout_s;
+};
+
+IdentAction identStep(double& ramp_ma, double& elapsed_s, int sign, double delta_rad,
+                      const IdentLimits& limits, double dt_s) {
+    if (sign == 0) sign = 1;
+    ramp_ma += static_cast<double>(sign) * limits.ramp_ma_s * dt_s;
+    elapsed_s += dt_s;
+    if (std::abs(delta_rad) >= limits.move_rad) return IdentAction::kLatch;
+    if (std::abs(ramp_ma) >= limits.max_ma) return IdentAction::kHitLimit;
+    if (elapsed_s >= limits.timeout_s) return IdentAction::kTimeout;
+    return IdentAction::kRamp;
+}
+}  // namespace
+
+// ── 起动电流辨识（ident）：状态机 ────────────────────────────────────────────
+// 目的：不靠 Kp/Kd/重力模型，直接测「该姿态下多少电流才让它动」。
+// 用法：/body_ident_command=[motor_id, +1/-1]，每姿态正反各打一次。
+void JxHardware::startIdent(size_t index, int sign) {
+    ident_motor_index_ = index;
+    ident_sign_ = sign >= 0 ? 1 : -1;
+    ident_base_q_ = joint_positions_[index];
+    ident_ramp_ma_ = 0.0;
+    ident_elapsed_s_ = 0.0;
+    ident_frozen_gravity_ma_ = 0.0;
+    ident_phase_ = IdentPhase::RAMP;
+    RCLCPP_WARN(get_node()->get_logger(),
+                "ident 开始：电机 %u 方向 %+d，起点 %.5f rad，ramp 上限 %.0f mA，"
+                "位移判据 %.4f°，超时 %.1f s（该轴此期间只剩重力前馈）",
+                motor_ids_[index], ident_sign_, ident_base_q_, ident_max_ma_,
+                ident_move_rad_ * 180.0 / M_PI, ident_timeout_s_);
+}
+
+void JxHardware::advanceIdent(size_t index, double dt_s, double gravity_ma) {
+    if (ident_phase_ != IdentPhase::RAMP || index != ident_motor_index_) {
+        return;
+    }
+    // 冻结重力前馈：位移只有 0.02° 量级，重力项本来就几乎不变；冻结后上报值
+    // 与整段 ramp 一一对应，分析侧不用再猜当时用的是哪一版重力。
+    ident_frozen_gravity_ma_ = gravity_ma;
+    const double delta_rad = joint_positions_[index] - ident_base_q_;
+    IdentLimits limits;
+    limits.max_ma = ident_max_ma_;
+    limits.ramp_ma_s = ident_ramp_ma_s_;
+    limits.move_rad = ident_move_rad_;
+    limits.timeout_s = ident_timeout_s_;
+    switch (identStep(ident_ramp_ma_, ident_elapsed_s_, ident_sign_, delta_rad, limits, dt_s)) {
+        case IdentAction::kLatch:    finishIdent(true, "动到了"); break;
+        case IdentAction::kHitLimit: finishIdent(false, "到 ramp 上限"); break;
+        case IdentAction::kTimeout:  finishIdent(false, "超时"); break;
+        case IdentAction::kRamp:     break;
+    }
+}
+
+void JxHardware::finishIdent(bool ok, const char* why) {
+    const size_t index = ident_motor_index_;
+    const double delta_deg =
+        (index < joint_positions_.size() ? joint_positions_[index] - ident_base_q_ : 0.0) *
+        180.0 / M_PI;
+    const double ramp_ma = ident_ramp_ma_;
+    const double gravity_ma = ident_frozen_gravity_ma_;
+    const int sign = ident_sign_;
+    // 先回 IDLE，再发布：发布回调里若有人立刻触发下一次，不会撞上“正在辨识”。
+    ident_phase_ = IdentPhase::IDLE;
+    ident_ramp_ma_ = 0.0;
+    ident_elapsed_s_ = 0.0;
+    std_msgs::msg::Float64MultiArray out;
+    // 布局（与 scripts/juxie_impedance.py hil 的 JSON 字段语义一致）：
+    //   [motor_id, sign, ramp_signed_ma, delta_deg, status, gravity_ma, total_ma]
+    out.data = {static_cast<double>(index < motor_ids_.size() ? motor_ids_[index] : 0u),
+                static_cast<double>(sign),
+                ramp_ma,
+                delta_deg,
+                ok ? 1.0 : 0.0,
+                gravity_ma,
+                ramp_ma + gravity_ma};
+    if (ident_result_pub_) {
+        ident_result_pub_->publish(out);
+    }
+    RCLCPP_WARN(get_node()->get_logger(),
+                "ident 结束（%s）：电机 %u 方向 %+d，ramp %+.1f mA，重力 %.1f mA，"
+                "合计 %+.1f mA，位移 %.4f°",
+                why ? why : "?",
+                index < motor_ids_.size() ? motor_ids_[index] : 0u, sign, ramp_ma,
+                gravity_ma, ramp_ma + gravity_ma, delta_deg);
+}
+
 void JxHardware::tripWaistCurrentInterlock(const char* reason) {
     waist_current_fault_.store(true);
     for (size_t i = 0; i < motor_ids_.size(); ++i) {
         if (isWaistMotor(i))
             latchOneMotorToCspHold(i, reason);
+    }
+    // 承重轴此刻只剩“抱闸”这一种不依赖母线电流的保持手段：
+    // 欠压/断电时 CSP 位置环也出不了力，发 CSP 请求等于什么都没做。
+    if (brake_on_waist_fault_) {
+        for (size_t i = 0; i < motor_ids_.size(); ++i) {
+            if (isWaistMotor(i))
+                requestBrakeEngage(i, reason);
+        }
     }
 }
 
@@ -1833,6 +2351,18 @@ void JxHardware::latchOneMotorToCspHold(size_t index, const char* reason) {
     // Keep the prior current history; latching does not make physical current zero.
 }
 
+void JxHardware::requestBrakeEngage(size_t index, const char* reason) {
+    // ⚠️ 调用方必须已持有 state_mutex_（或处于未激活的 on_init/on_activate 路径）。
+    if (index >= brake_engage_requested_.size() || brake_engage_requested_[index]) {
+        return;
+    }
+    brake_engage_requested_[index] = 1;
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Motor %u: %s; 切到抱闸控制字 0x%02X（失能 + 不松闸 + 清错），"
+                 "此后每帧保持",
+                 motor_ids_[index], reason, CTRL_WORD_BRAKE_ENGAGE_CLEAR);
+}
+
 // Caller holds state_mutex_, or owns the inactive hardware during activation.
 void JxHardware::resetPositionTarget(size_t index) {
     const int16_t target = motor_hold_latched_[index] ? latched_hold_positions_[index]
@@ -1845,6 +2375,30 @@ void JxHardware::resetPositionTarget(size_t index) {
 
 // === 新协议适配 START: 解析并发布新版16bit错误码 ===
 void JxHardware::parseAndReportErrorCode(uint8_t motor_id, uint16_t error_code_raw, const std::string& source) {
+    // ── 节流 ─────────────────────────────────────────────────────────────
+    // 这里在 **500 Hz 读路径** 上被每帧调用。电机一旦持续报错，不节流就是每秒
+    // 数千条日志 + 数千次 publish，全部同步写盘 ⇒ 读环节被阻塞，
+    // controller_manager 的 2 ms 周期被撑到 7.4 ms（2026-11-03 实测：55 min
+    // 518 MB 日志、Read time 731 us）。
+    // 规则：错误码**变化**立即上报；同一错误码最多 1 Hz 重复一次；
+    //       其余只累加抑制计数，下次上报时一并打印。
+    const double now_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (last_error_report_s_.size() <= motor_id) {
+        last_error_report_s_.resize(motor_id + 1, -1e9);
+        last_reported_error_code_.resize(motor_id + 1, 0xFFFFu);
+        suppressed_error_reports_.resize(motor_id + 1, 0u);
+    }
+    const bool code_changed = last_reported_error_code_[motor_id] != error_code_raw;
+    if (!code_changed && (now_s - last_error_report_s_[motor_id]) < 1.0) {
+        ++suppressed_error_reports_[motor_id];
+        return;
+    }
+    const uint32_t suppressed = suppressed_error_reports_[motor_id];
+    suppressed_error_reports_[motor_id] = 0;
+    last_reported_error_code_[motor_id] = error_code_raw;
+    last_error_report_s_[motor_id] = now_s;
+
     std::vector<std::string> error_messages;
     bool any_error = false;
 
@@ -1912,6 +2466,13 @@ void JxHardware::parseAndReportErrorCode(uint8_t motor_id, uint16_t error_code_r
             }
         }
         RCLCPP_ERROR(get_node()->get_logger(), "%s (raw: 0x%04X, SEVERE)", error_str.c_str(), error_code_raw);
+        if (suppressed > 0) {
+            RCLCPP_ERROR(get_node()->get_logger(),
+                         "Motor %u: 上面这条故障在最近 1 s 内又重复了 %u 次"
+                         "（已抑制，避免刷爆日志/阻塞 500 Hz 控制环）",
+                         static_cast<unsigned>(motor_id),
+                         static_cast<unsigned>(suppressed));
+        }
     }
 }
 // === 新协议适配 END ===
